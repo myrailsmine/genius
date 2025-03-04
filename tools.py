@@ -4,13 +4,13 @@ import requests
 import wikipedia
 from duckduckgo_search import DDGS
 from pydantic import BaseModel
-from strip_tags import strip_tags
 from document_ai_agents.logger import logger
 from utils.logger import PerformanceLogger, AsyncLogger
 from utils.config import LOG_LEVEL, MAX_LENGTH, TEMPERATURE, TOP_P, STOP_SEQUENCES
 from utils.llm_client import LLMClient
 import asyncio
 import time
+from html.parser import HTMLParser
 
 # Set log level from config
 from loguru import logger
@@ -58,6 +58,23 @@ def catch_exceptions(func: Callable) -> Callable:
             await perf_logger.async_stop(f"tool_{func.__name__}")
             return ErrorResponse(error=str(e))
     return wrapper
+
+class HTMLStripper(HTMLParser):
+    """
+    A simple HTML parser to strip HTML tags and return plain text.
+    """
+    def __init__(self):
+        super().__init__()
+        self.reset()
+        self.strict = False
+        self.convert_charrefs = True
+        self.text = []
+
+    def handle_data(self, data):
+        self.text.append(data)
+
+    def get_text(self):
+        return "".join(self.text)
 
 @lru_cache(maxsize=1024)
 def cached_wikipedia_page(title: str) -> wikipedia.WikipediaPage:
@@ -113,7 +130,9 @@ async def get_wikipedia_page(page_title: str, max_text_size: int = 16_000) -> Fu
     """
     try:
         page = cached_wikipedia_page(page_title)
-        full_content = strip_tags(page.html())
+        stripper = HTMLStripper()
+        stripper.feed(page.html())
+        full_content = stripper.get_text()
         full_page = FullPage(
             page_title=page.title,
             page_url=page.url,
@@ -169,7 +188,9 @@ async def get_page_content(page_url: str, max_text_size: int = 16_000) -> FullPa
         response = await asyncio.to_thread(requests.get, page_url)
         response.raise_for_status()
         html = response.text
-        content = strip_tags(html)
+        stripper = HTMLStripper()
+        stripper.feed(html)
+        content = stripper.get_text()
         content = "\n".join([x for x in content.split("\n") if x.strip()])
         # Extract title from HTML (simplified)
         title = html.split("<title>")[1].split("</title>")[0] if "<title>" in html else page_url
