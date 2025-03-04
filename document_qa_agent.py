@@ -3,9 +3,10 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, AsyncGenerator
 from utils.llm_client import LLMClient
 from utils.config import LOG_LEVEL, MAX_LENGTH, TEMPERATURE, TOP_P, STOP_SEQUENCES
-from document_ai_agents.logger import logger
+from utils.logger import logger, AsyncLogger
 import asyncio
 import json
+from pathlib import Path
 
 # Set log level from config
 from loguru import logger
@@ -39,12 +40,13 @@ class DocumentQAAgent:
         image_context = "\n".join([await asyncio.to_thread(self.llm_client.process_image, img) for img in state.pages_as_images[:5]])
         
         # Use hierarchical reasoning to generate a structured response
+        # Ensure no raw backslashes in the prompt by normalizing paths and sanitizing strings
         prompt = (
-            f"Question: {state.question}\n"
-            f"Text Context: {text_context}\n"
-            f"Image Context: {image_context}\n"
+            f"Question: {state.question.replace('\\', '\\\\')}\n"
+            f"Text Context: {text_context.replace('\\', '\\\\')}\n"
+            f"Image Context: {image_context.replace('\\', '\\\\')}\n"
             "Provide a detailed Chain of Thought (CoT) response with rationale, relevant_context, and answer in JSON format: "
-            f"{AnswerChainOfThoughts.model_json_schema()}"
+            f"{AnswerChainOfThoughts.model_json_schema().replace('\\', '\\\\')}"
         )
         response = await asyncio.to_thread(self.llm_client.generate, prompt, image_base64=None if not state.pages_as_images else state.pages_as_images[0])
         
@@ -52,7 +54,7 @@ class DocumentQAAgent:
             import json
             answer_cot = AnswerChainOfThoughts(**json.loads(response))
         except Exception as e:
-            logger.error(f"Failed to parse CoT response: {e}")
+            await AsyncLogger.error(f"Failed to parse CoT response: {e}")
             answer_cot = AnswerChainOfThoughts(
                 rationale="Error in processing",
                 relevant_context=f"Text: {text_context}\nImages: {image_context}",
@@ -63,8 +65,18 @@ class DocumentQAAgent:
 
     async def stream_answer(self, state: DocumentQAState) -> AsyncGenerator[str, None]:
         """Stream the QA response token by token for real-time chat."""
+        # Sanitize strings to handle backslashes
+        text_context = "\n".join(state.pages_as_text[:5]).replace('\\', '\\\\')
+        image_context = "\n".join([await asyncio.to_thread(self.llm_client.process_image, img.replace('\\', '\\\\')) for img in state.pages_as_images[:5]])
+        
+        prompt = (
+            f"Question: {state.question.replace('\\', '\\\\')}\n"
+            f"Text Context: {text_context}\n"
+            f"Image Context: {image_context}\n"
+            "Answer:"
+        )
         async for token in self.llm_client.generate_stream(
-            f"Question: {state.question}\nText Context: {'\n'.join(state.pages_as_text[:5])}\nImage Context: {'\n'.join(await asyncio.gather(*[asyncio.to_thread(self.llm_client.process_image, img) for img in state.pages_as_images[:5]]))}\nAnswer:",
+            prompt,
             image_base64=None if not state.pages_as_images else state.pages_as_images[0]
         ):
             yield token
