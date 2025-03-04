@@ -56,7 +56,7 @@ class PerformanceLogger:
             duration = time.time() - self.start_time
             self.response_time.labels(agent=agent_name).observe(duration)
             self.requests.labels(agent=agent_name).inc()
-            logger.info(f"Agent {agent_name} processed in {duration:.2f} seconds")
+            await asyncio.to_thread(logger.info, f"Agent {agent_name} processed in {duration:.2f} seconds")
 
 class AsyncLogger:
     """
@@ -77,8 +77,16 @@ class AsyncLogger:
         """Asynchronously log a warning message."""
         await asyncio.to_thread(logger.warning, message, *args, **kwargs)
 
-# Configure standard logging to use loguru
+# Configure standard logging to use loguru and load from config
+from utils.config import LOG_LEVEL, LOG_FORMAT, LOG_FILE
+
 logging.basicConfig(handlers=[InterceptHandler()], level=logging.DEBUG, force=True)
+
+# Configure loguru logger with config values
+logger.remove()
+logger.add(lambda msg: print(msg), level=LOG_LEVEL, format=LOG_FORMAT)
+if LOG_FILE:
+    logger.add(LOG_FILE, level=LOG_LEVEL, format=LOG_FORMAT, rotation="500 MB", retention="10 days")
 
 # Initialize global performance logger
 performance_logger = PerformanceLogger()
