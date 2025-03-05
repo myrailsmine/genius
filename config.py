@@ -35,10 +35,6 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()  # Logging verbosity (DEBUG, 
 LOG_FORMAT = os.getenv("LOG_FORMAT", "{time} {level} {message}")  # Loguru format string
 LOG_FILE = os.getenv("LOG_FILE", "agentic_rag.log")  # Optional log file path
 
-# Performance Monitoring Configuration
-PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "9090"))  # Prometheus metrics port
-PROMETHEUS_ENABLED = os.getenv("PROMETHEUS_ENABLED", "true").lower() == "true"
-
 # Database Configuration
 DATABASE_DEFAULT = os.getenv("DATABASE_DEFAULT", "sqlite:///path/to/database.db")  # Default database connection string
 
@@ -68,6 +64,8 @@ if not (0 <= TOP_P <= 1.0):
 if not (0 <= IMAGE_QUALITY <= 100):
     raise ValueError("IMAGE_QUALITY must be between 0 and 100")
 
+# Configure loguru logger (ensuring compatibility with utils.logger)
+from loguru import logger
 logger.remove()
 logger.add(lambda msg: print(msg), level=LOG_LEVEL, format=LOG_FORMAT)
 if LOG_FILE:
