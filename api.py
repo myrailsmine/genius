@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import asyncio
@@ -10,11 +10,16 @@ from pathlib import Path
 import os
 from utils.logger import AsyncLogger
 from utils.config import API_HOST, API_PORT, WEBSOCKET_URL, LOG_LEVEL
-from fastapi_limiter import FastAPILimiter
-from fastapi_limiter.depends import RateLimiter
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="Agentic RAG Framework API", version="0.1.0")
+# Custom lifespan for FastAPI
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # No startup/shutdown tasks needed for now
+
+app = FastAPI(title="Agentic RAG Framework API", version="0.1.0", lifespan=lifespan)
 
 # Add CORS middleware
 origins = [
@@ -29,11 +34,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.on_event("startup")
-async def startup_event():
-    # Initialize rate limiting
-    await FastAPILimiter.init(app)
 
 class ChatMessage(BaseModel):
     message: str
@@ -72,7 +72,7 @@ async def create_knowledge_base(entries: List[KnowledgeBaseEntry]):
     await AsyncLogger.info(f"Knowledge base created/updated for IDs: {[entry.id for entry in entries]}")
     return {"message": "Knowledge base created/updated", "id": [entry.id for entry in entries]}
 
-@app.post("/upload_and_query", dependencies=[Depends(RateLimiter(times=5, minutes=1))])
+@app.post("/upload_and_query")
 async def upload_and_query(file: UploadFile = File(...), question: Optional[str] = None, summarize: bool = False, database_connection: Optional[str] = None):
     """Upload a PDF and process a QA or summarization query with optional database integration."""
     if not question and not summarize:
