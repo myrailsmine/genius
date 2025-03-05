@@ -1,134 +1,81 @@
-import inspect
-import logging
-import time
-from loguru import logger
-from typing import Optional
 from prometheus_client import Counter, Histogram
+from typing import Optional
+import time
 import asyncio
-
-class InterceptHandler(logging.Handler):
-    """
-    Intercept standard logging calls and redirect them to loguru.
-    
-    Args:
-        record (logging.LogRecord): The logging record to emit.
-    """
-    def emit(self, record: logging.LogRecord) -> None:
-        if record.levelno < logging.INFO:
-            return
-        level: str | int
-        try:
-            level = logger.level(record.levelname).name
-        except ValueError:
-            level = record.levelno
-        frame, depth = inspect.currentframe(), 0
-        while frame and (depth == 0 or frame.f_code.co_filename == logging.__file__):
-            frame = frame.f_back
-            depth += 1
-        logger.opt(depth=depth, exception=record.exc_info).log(
-            level, record.getMessage()
-        )
-
-class PerformanceLogger:
-    """
-    Log performance metrics for agents, including response time and request counts, using Prometheus.
-    """
-    def __init__(self):
-        self.requests = Counter("requests_total", "Total requests by agent", ["agent"])
-        self.response_time = Histogram("response_time_seconds", "Response time in seconds by agent", ["agent"])
-        self.start_time = None
-
-    def start(self) -> None:
-        """Start timing a request."""
-        self.start_time = time.time()
-
-    def stop(self, agent_name: str) -> None:
-        """Stop timing and log the duration, incrementing metrics."""
-        if self.start_time:
-            duration = time.time() - self.start_time
-            self.response_time.labels(agent=agent_name).observe(duration)
-            self.requests.labels(agent=agent_name).inc()
-            logger.info(f"Agent {agent_name} processed in {duration:.2f} seconds")
-
-    async def async_stop(self, agent_name: str) -> None:
-        """Asynchronously stop timing and log the duration, incrementing metrics."""
-        if self.start_time:
-            duration = time.time() - self.start_time
-            self.response_time.labels(agent=agent_name).observe(duration)
-            self.requests.labels(agent=agent_name).inc()
-            await asyncio.to_thread(logger.info, f"Agent {agent_name} processed in {duration:.2f} seconds")
-
-class AsyncLogger:
-    """
-    Async wrapper for logging to ensure compatibility with asynchronous workflows.
-    """
-    @staticmethod
-    async def info(message: str, *args, **kwargs) -> None:
-        """Asynchronously log an info message."""
-        await asyncio.to_thread(logger.info, message, *args, **kwargs)
-
-    @staticmethod
-    async def error(message: str, *args, **kwargs) -> None:
-        """Asynchronously log an error message."""
-        await asyncio.to_thread(logger.error, message, *args, **kwargs)
-
-    @staticmethod
-    async def warning(message: str, *args, **kwargs) -> None:
-        """Asynchronously log a warning message."""
-        await asyncio.to_thread(logger.warning, message, *args, **kwargs)
-
-# Configure standard logging to use loguru and load from config
+from loguru import logger
 from utils.config import LOG_LEVEL, LOG_FORMAT, LOG_FILE
 
-logging.basicConfig(handlers=[InterceptHandler()], level=logging.DEBUG, force=True)
-
-# Configure loguru logger with config values
+# Set log level from config
 logger.remove()
 logger.add(lambda msg: print(msg), level=LOG_LEVEL, format=LOG_FORMAT)
 if LOG_FILE:
     logger.add(LOG_FILE, level=LOG_LEVEL, format=LOG_FORMAT, rotation="500 MB", retention="10 days")
 
-# Initialize global performance logger
-performance_logger = PerformanceLogger()
-
-# Example usage in synchronous context
-def log_agent_performance(agent_name: str, message: str) -> None:
+class PerformanceLogger:
     """
-    Log agent performance in a synchronous context.
-    
-    Args:
-        agent_name (str): Name of the agent.
-        message (str): Message to log.
+    A class to log performance metrics (e.g., request counts, response times) using Prometheus.
     """
-    performance_logger.start()
-    logger.info(f"Starting {agent_name}: {message}")
-    # Simulate work
-    time.sleep(1)
-    performance_logger.stop(agent_name)
-    logger.info(f"Completed {agent_name}: {message}")
+    def __init__(self, registry: Optional[CollectorRegistry] = None):
+        """
+        Initialize the PerformanceLogger with an optional CollectorRegistry.
+        
+        Args:
+            registry (Optional[CollectorRegistry]): Prometheus CollectorRegistry to use for metrics.
+        """
+        self.registry = registry or CollectorRegistry()  # Use provided registry or default
+        self.start_time = None
+        self.requests = Counter("api_requests_total", "Total API requests by endpoint", ["endpoint"], registry=self.registry)
+        self.response_time = Histogram("api_response_time_seconds", "API response time in seconds by endpoint", ["endpoint"], registry=self.registry)
 
-# Example usage in asynchronous context
-async def async_log_agent_performance(agent_name: str, message: str) -> None:
+    def start(self):
+        """Start timing a request."""
+        self.start_time = time.time()
+
+    async def async_stop(self, endpoint: str):
+        """
+        Asynchronously stop timing a request and log the duration.
+        
+        Args:
+            endpoint (str): The endpoint being measured.
+        """
+        if self.start_time is None:
+            logger.warning(f"No start time recorded for endpoint {endpoint}")
+            return
+        duration = time.time() - self.start_time
+        self.response_time.labels(endpoint=endpoint).observe(duration)
+        logger.info(f"Endpoint {endpoint} processed in {duration:.2f} seconds")
+        self.start_time = None
+
+    def stop(self, endpoint: str):
+        """
+        Synchronously stop timing a request and log the duration.
+        
+        Args:
+            endpoint (str): The endpoint being measured.
+        """
+        if self.start_time is None:
+            logger.warning(f"No start time recorded for endpoint {endpoint}")
+            return
+        duration = time.time() - self.start_time
+        self.response_time.labels(endpoint=endpoint).observe(duration)
+        logger.info(f"Endpoint {endpoint} processed in {duration:.2f} seconds")
+        self.start_time = None
+
+class AsyncLogger:
     """
-    Log agent performance in an asynchronous context.
-    
-    Args:
-        agent_name (str): Name of the agent.
-        message (str): Message to log.
+    A utility class for asynchronous logging with loguru.
     """
-    performance_logger.start()
-    await AsyncLogger.info(f"Starting {agent_name}: {message}")
-    # Simulate async work
-    await asyncio.sleep(1)
-    await performance_logger.async_stop(agent_name)
-    await AsyncLogger.info(f"Completed {agent_name}: {message}")
+    @staticmethod
+    async def info(message: str):
+        """Asynchronously log an info message."""
+        await asyncio.to_thread(logger.info, message)
 
-if __name__ == "__main__":
-    # Synchronous example
-    log_agent_performance("rag_agent", "Processing document QA")
+    @staticmethod
+    async def warning(message: str):
+        """Asynchronously log a warning message."""
+        await asyncio.to_thread(logger.warning, message)
 
-    # Asynchronous example
-    async def run_async():
-        await async_log_agent_performance("rag_agent", "Processing multimodal QA")
-    
-    asyncio.run(run_async())
+    @staticmethod
+    async def error(message: str):
+        """Asynchronously log an error message."""
+        await asyncio.to_thread(logger.error, message)
