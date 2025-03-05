@@ -46,7 +46,7 @@ async def startup_event():
     global requests, response_time, perf_logger
     requests = Counter("api_requests_total", "Total API requests by endpoint", ["endpoint"], registry=metrics_registry)
     response_time = Histogram("api_response_time_seconds", "API response time in seconds by endpoint", ["endpoint"], registry=metrics_registry)
-    perf_logger = PerformanceLogger()
+    perf_logger = PerformanceLogger(registry=metrics_registry)  # Pass the custom registry to PerformanceLogger
     
     # Initialize rate limiting
     await FastAPILimiter.init(app)
