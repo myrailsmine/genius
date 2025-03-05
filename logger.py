@@ -1,5 +1,6 @@
 from prometheus_client import Counter, Histogram
 from typing import Optional
+from prometheus_client import CollectorRegistry
 import time
 import asyncio
 from loguru import logger
