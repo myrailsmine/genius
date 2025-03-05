@@ -63,12 +63,20 @@ async def test_phoenix_connection():
             "model": MODEL_NAME_API,
             "error": str(e)
         }
+import asyncio
+from utils.llm_client import LLMClient
+
+async def test_alternate_phoenix():
+    llm_client = LLMClient(endpoint_type="phoenix_alt", workspace_a="nb", workspace_b="km74h")
+    response = await llm_client.generate("What is the capital of France?")
+    logger.info(f"Alternate Phoenix response: {response}")
+
 
 def run_test():
     """
     Run the async test synchronously for convenience.
     """
-    result = asyncio.run(test_phoenix_connection())
+    result = asyncio.run(test_alternate_phoenix())
     print(json.dumps(result, indent=2))
 
 if __name__ == "__main__":
