@@ -1,111 +1,75 @@
-from langgraph.graph import END, START, StateGraph, Send
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
-from typing import Annotated, Literal
-import operator
-import asyncio
+from typing import Optional, List
+from langchain_core.documents import Document
+from document_utils import async_extract_text_from_pdf, async_extract_images_from_pdf
+from utils.image_utils import pil_image_to_base64_jpeg
 from utils.llm_client import LLMClient
-from document_utils import extract_images_from_pdf, extract_text_from_pdf
-from image_utils import pil_image_to_base64_jpeg, base64_to_pil_image
-from document_ai_agents.logger import logger
-from transformers import BlipProcessor, BlipForConditionalGeneration
-from utils.config import DEVICE
+from utils.config import LOG_LEVEL, MAX_IMAGES, IMAGE_QUALITY
+from utils.logger import logger, AsyncLogger
+import asyncio
+from agent_registry import agent_registry  # Added import for agent_registry
 
-class DetectedLayoutItem(BaseModel):
-    element_type: Literal["Table", "Figure", "Image", "Text-block"] = Field(
-        ..., description="Type of detected Item. Find Tables, figures, and images. Use Text-Block for everything else, be as exhaustive as possible. Return 10 Items at most."
-    )
-    summary: str = Field(..., description="A detailed description of the layout Item.")
-    coordinates: Optional[dict] = Field(None, description="Bounding box coordinates if applicable")
-
-class LayoutElements(BaseModel):
-    layout_items: list[DetectedLayoutItem] = Field(default_factory=list)
+# Set log level from config
+from loguru import logger
+logger.remove()
+logger.add(lambda msg: print(msg), level=LOG_LEVEL, format="{time} {level} {message}")
 
 class DocumentLayoutParsingState(BaseModel):
     document_path: str
-    pages_as_base64_jpeg_images: list[str] = Field(default_factory=list)
-    pages_as_text: list[str] = Field(default_factory=list)
-    documents: Annotated[list[Document], operator.add] = Field(default_factory=list)
+    pages_as_text: List[str] = Field(default_factory=list)
+    pages_as_base64_jpeg_images: List[str] = Field(default_factory=list)
+    documents: List[Document] = Field(default_factory=list)
 
-class FindLayoutItemsInput(BaseModel):
-    document_path: str
-    base64_jpeg: str
-    page_text: str
-    page_number: int
-
-@agent_registry.register("parsing_agent")
+@agent_registry.register(
+    name="parsing_agent",
+    capabilities=["parsing"],
+    supported_doc_types=["generic", "term_sheet", "research_paper"]
+)
 class DocumentParsingAgent:
     def __init__(self):
         self.llm_client = LLMClient()
-        self.vision_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        self.vision_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(DEVICE)
         self.graph = self.build_agent()
 
-    async def get_images_and_text(self, state: DocumentLayoutParsingState):
-        assert Path(state.document_path).is_file(), "File does not exist"
-        # Async extraction
-        images = await asyncio.to_thread(extract_images_from_pdf, state.document_path)
-        texts = await asyncio.to_thread(extract_text_from_pdf, state.document_path)
-        assert images, "No images extracted"
-        state.pages_as_base64_jpeg_images = [pil_image_to_base64_jpeg(x) for x in images]
-        state.pages_as_text = texts
-        return state
-
-    async def continue_to_find_layout_items(self, state: DocumentLayoutParsingState):
-        return [
-            Send(
-                "find_layout_items",
-                FindLayoutItemsInput(
-                    base64_jpeg=base64_jpeg,
-                    page_text=text,
-                    page_number=i,
-                    document_path=state.document_path,
-                ),
-            )
-            for i, (base64_jpeg, text) in enumerate(zip(state.pages_as_base64_jpeg_images, state.pages_as_text))
-        ]
-
-    async def find_layout_items(self, state: FindLayoutItemsInput):
-        logger.info(f"Processing page {state.page_number + 1}")
-        image = base64_to_pil_image(state.base64_jpeg)
-        # Multimodal analysis with text and image
-        image_caption = await asyncio.to_thread(self.process_image, image)
-        prompt = (
-            f"Analyze this page: Text: {state.page_text}\nImage Description: {image_caption}\n"
-            "Identify layout items (Tables, Figures, Images, Text-blocks) with summaries and coordinates if applicable. "
-            "Return JSON: {LayoutElements.model_json_schema()}"
-        )
-        response = await asyncio.to_thread(self.llm_client.generate, prompt, image_base64=state.base64_jpeg)
+    async def parse_document(self, state: DocumentLayoutParsingState) -> dict:
         try:
-            import json
-            layout_items = LayoutElements(**json.loads(response))
-            documents = [
-                Document(
-                    page_content=item.summary,
-                    metadata={
-                        "page_number": state.page_number,
-                        "element_type": item.element_type,
-                        "coordinates": item.coordinates,
-                        "document_path": state.document_path,
-                        "image_base64": state.base64_jpeg if item.element_type == "Image" else None,
-                    },
-                )
-                for item in layout_items.layout_items
+            # Extract text and images asynchronously
+            text_pages = await async_extract_text_from_pdf(state.document_path)
+            image_pages = await async_extract_images_from_pdf(state.document_path)
+            
+            # Limit images to MAX_IMAGES and convert to base64
+            state.pages_as_text = text_pages[:5]  # Limit text for brevity
+            state.pages_as_base64_jpeg_images = [
+                await asyncio.to_thread(pil_image_to_base64_jpeg, img, quality=IMAGE_QUALITY)
+                for img in image_pages[:MAX_IMAGES]
             ]
-            return {"documents": documents}
+            
+            # Create documents for RAG
+            state.documents = [
+                Document(page_content=text, metadata={"page_number": i, "element_type": "Text-block"})
+                for i, text in enumerate(state.pages_as_text)
+            ] + [
+                Document(page_content="", metadata={"page_number": i, "element_type": "Image", "image_base64": img_base64})
+                for i, img_base64 in enumerate(state.pages_as_base64_jpeg_images)
+            ]
+            
+            await AsyncLogger.info(f"Parsed document {state.document_path} into {len(state.documents)} documents")
+            return {
+                "pages_as_text": state.pages_as_text,
+                "pages_as_base64_jpeg_images": state.pages_as_base64_jpeg_images,
+                "documents": state.documents
+            }
         except Exception as e:
-            logger.error(f"Failed to parse layout items: {e}")
-            return {"documents": [Document(page_content="Default text-block", metadata={"page_number": state.page_number, "element_type": "Text-block", "document_path": state.document_path})]}
-
-    def process_image(self, image):
-        inputs = self.vision_processor(images=image, return_tensors="pt").to(DEVICE)
-        out = self.vision_model.generate(**inputs)
-        return self.vision_processor.decode(out[0], skip_special_tokens=True)
+            await AsyncLogger.error(f"Error parsing document {state.document_path}: {e}")
+            return {
+                "pages_as_text": [],
+                "pages_as_base64_jpeg_images": [],
+                "documents": []
+            }
 
     def build_agent(self):
         builder = StateGraph(DocumentLayoutParsingState)
-        builder.add_node("get_images_and_text", self.get_images_and_text)
-        builder.add_node("find_layout_items", self.find_layout_items)
-        builder.add_edge(START, "get_images_and_text")
-        builder.add_conditional_edges("get_images_and_text", self.continue_to_find_layout_items)
-        builder.add_edge("find_layout_items", END)
+        builder.add_node("parse_document", self.parse_document)
+        builder.add_edge(START, "parse_document")
+        builder.add_edge("parse_document", END)
         return builder.compile()
