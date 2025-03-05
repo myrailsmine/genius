@@ -2,6 +2,7 @@ from sentence_transformers import SentenceTransformer
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 from typing import Optional, Annotated, List, AsyncGenerator
+from langchain_core.documents import Document
 from document_utils import extract_text_from_pdf
 from agent_registry import agent_registry
 from utils.llm_client import LLMClient
@@ -9,7 +10,7 @@ from utils.config import LOG_LEVEL
 from utils.hierarchical_planner import HierarchicalPlanner
 from utils.reflective_agent import ReflectiveAgent
 import numpy as np
-from sklearn.preprocessing import softmax
+from scipy.special import softmax  # Updated import from scipy.special
 import asyncio
 import json
 
@@ -138,7 +139,7 @@ class RouterAgent:
         if state.feedback and state.result:
             reflection = await asyncio.to_thread(self.reflector.reflect, state.query, state.result.get("response", ""), state.feedback)
             # Apply improvements to agent strategies or store for learning
-            logger.info(f"Reflection for query {state.query}: {reflection}")
+            await AsyncLogger.info(f"Reflection for query {state.query}: {reflection}")
             return {"result": {**state.result, "reflection": reflection}}
         return state
 
