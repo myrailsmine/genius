@@ -8,9 +8,8 @@ from agents.document_rag_agent import DocumentRAGState, DocumentRAGAgent
 from agents.document_parsing_agent import DocumentLayoutParsingState, DocumentParsingAgent
 from pathlib import Path
 import os
-from utils.logger import PerformanceLogger, AsyncLogger
-from utils.config import API_HOST, API_PORT, WEBSOCKET_URL, LOG_LEVEL, PROMETHEUS_PORT, PROMETHEUS_ENABLED
-from prometheus_client import generate_latest, Counter, Histogram, CollectorRegistry
+from utils.logger import AsyncLogger
+from utils.config import API_HOST, API_PORT, WEBSOCKET_URL, LOG_LEVEL
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
 from pydantic import BaseModel
@@ -31,30 +30,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Custom CollectorRegistry for metrics
-metrics_registry = CollectorRegistry()
-
 @app.on_event("startup")
 async def startup_event():
-    if PROMETHEUS_ENABLED:
-        # Start Prometheus metrics server in a separate thread
-        import threading
-        from prometheus_client import start_http_server
-        threading.Thread(target=start_http_server, args=(PROMETHEUS_PORT,), daemon=True).start()
-    
-    # Initialize metrics in the registry
-    global requests, response_time, perf_logger
-    requests = Counter("api_requests_total", "Total API requests by endpoint", ["endpoint"], registry=metrics_registry)
-    response_time = Histogram("api_response_time_seconds", "API response time in seconds by endpoint", ["endpoint"], registry=metrics_registry)
-    perf_logger = PerformanceLogger(registry=metrics_registry)  # Pass the custom registry to PerformanceLogger
-    
     # Initialize rate limiting
     await FastAPILimiter.init(app)
-
-@app.get("/metrics")
-async def metrics():
-    """Expose Prometheus metrics for monitoring."""
-    return StreamingResponse(generate_latest(registry=metrics_registry), media_type="text/plain")
 
 class ChatMessage(BaseModel):
     message: str
@@ -99,7 +78,7 @@ async def upload_and_query(file: UploadFile = File(...), question: Optional[str]
     if not question and not summarize:
         raise HTTPException(status_code=400, detail="Question or summarize flag is required")
     
-    perf_logger.start()
+    start_time = time.time()
     file_path = f"temp_{file.filename}"
     try:
         with open(file_path, "wb") as f:
@@ -114,8 +93,8 @@ async def upload_and_query(file: UploadFile = File(...), question: Optional[str]
         )
         result = await router.graph.ainvoke(state)
         await AsyncLogger.info(f"Processed query for {file.filename}: {result['result']}")
-        requests.labels(endpoint="upload_and_query").inc()
-        await perf_logger.async_stop("upload_and_query")
+        duration = time.time() - start_time
+        await AsyncLogger.info(f"Endpoint /upload_and_query processed in {duration:.2f} seconds")
         return result["result"]
     except Exception as e:
         await AsyncLogger.error(f"Error processing upload_and_query: {e}")
@@ -128,7 +107,7 @@ async def upload_and_query(file: UploadFile = File(...), question: Optional[str]
 async def websocket_endpoint(websocket: WebSocket):
     """Handle real-time chat with streaming responses, supporting multimodal and agentic queries."""
     await websocket.accept()
-    perf_logger.start()
+    start_time = time.time()
     try:
         while True:
             data = await websocket.receive_json()
@@ -151,21 +130,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"end": True})
             
             await stream_response()
-            requests.labels(endpoint="chat").inc()
-            await perf_logger.async_stop("chat_endpoint")
+            duration = time.time() - start_time
+            await AsyncLogger.info(f"Endpoint /chat processed in {duration:.2f} seconds")
     except Exception as e:
         await AsyncLogger.error(f"Error in chat endpoint: {e}")
         await websocket.send_json({"error": str(e)})
     finally:
-        await perf_logger.async_stop("chat_endpoint")
+        duration = time.time() - start_time
+        await AsyncLogger.info(f"Endpoint /chat completed in {duration:.2f} seconds")
 
 @app.post("/feedback")
 async def submit_feedback(query: str, response: str, rating: int, comment: Optional[str] = None):
     """Submit user feedback for agent improvement."""
+    start_time = time.time()
     await AsyncLogger.info(f"Feedback - Query: {query}, Response: {response}, Rating: {rating}, Comment: {comment}")
     router = agent_registry.get_agent("router_agent")()
     state = RouterState(query=query, result={"response": response}, feedback=f"Rating: {rating}, Comment: {comment}")
     result = await router.graph.ainvoke(state)
+    duration = time.time() - start_time
+    await AsyncLogger.info(f"Endpoint /feedback processed in {duration:.2f} seconds")
     return {"message": "Feedback received and processed", "reflection": result["result"].get("reflection", {})}
 
 if __name__ == "__main__":
