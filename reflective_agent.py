@@ -1,10 +1,11 @@
 from typing import Optional, Dict, AsyncGenerator
 from utils.llm_client import LLMClient
 from utils.config import MAX_LENGTH, TEMPERATURE, TOP_P, STOP_SEQUENCES, REFLECTION_ENABLED
-from document_ai_agents.logger import logger
+from utils.logger import logger, AsyncLogger
 import asyncio
 import json
 import time
+from langchain_core.documents import Document
 
 class ReflectiveAgent:
     """
@@ -57,10 +58,10 @@ class ReflectiveAgent:
             reflection = json.loads(response)
             if not isinstance(reflection, dict) or not all(key in reflection for key in ["errors", "improvements", "strategy"]):
                 raise ValueError("Invalid reflection format: must include 'errors', 'improvements', and 'strategy'")
-            logger.info(f"Reflection completed in {duration:.2f} seconds: {reflection}")
+            await AsyncLogger.info(f"Reflection completed in {duration:.2f} seconds: {reflection}")
             return reflection
         except Exception as e:
-            logger.error(f"Failed to parse reflection: {e}")
+            await AsyncLogger.error(f"Failed to parse reflection: {e}")
             return {"errors": "None", "improvements": "None", "strategy": "Maintain current approach"}
 
     async def stream_reflection(self, query: str, response: str, feedback: Optional[str] = None, multimodal_context: Optional[dict] = None) -> AsyncGenerator[str, None]:
@@ -125,8 +126,8 @@ class ReflectiveAgent:
             refined_strategy = response.strip()
             if not isinstance(refined_strategy, str) or not refined_strategy:
                 raise ValueError("Invalid refined strategy format")
-            logger.info(f"Refined strategy in {duration:.2f} seconds: {refined_strategy}")
+            await AsyncLogger.info(f"Refined strategy in {duration:.2f} seconds: {refined_strategy}")
             return refined_strategy
         except Exception as e:
-            logger.error(f"Failed to refine strategy: {e}")
+            await AsyncLogger.error(f"Failed to refine strategy: {e}")
             return agent_strategy
