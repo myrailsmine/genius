@@ -10,9 +10,10 @@ from pathlib import Path
 import os
 from utils.logger import PerformanceLogger, AsyncLogger
 from utils.config import API_HOST, API_PORT, WEBSOCKET_URL, LOG_LEVEL, PROMETHEUS_PORT, PROMETHEUS_ENABLED
-from prometheus_client import generate_latest, Counter, Histogram
+from prometheus_client import generate_latest, Counter, Histogram, CollectorRegistry
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
+from pydantic import BaseModel
 
 app = FastAPI(title="Agentic RAG Framework API", version="0.1.0")
 
@@ -30,21 +31,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize performance metrics
-requests = Counter("api_requests_total", "Total API requests by endpoint", ["endpoint"])
-response_time = Histogram("api_response_time_seconds", "API response time in seconds by endpoint", ["endpoint"])
-perf_logger = PerformanceLogger()
-
-class ChatMessage:
-    def __init__(self, message: str, document_path: Optional[str] = None, knowledge_base_id: Optional[str] = None, database_connection: Optional[str] = None, feedback: Optional[str] = None):
-        self.message = message
-        self.document_path = document_path
-        self.knowledge_base_id = knowledge_base_id
-        self.database_connection = database_connection
-        self.feedback = feedback
-
-# In-memory storage for knowledge base (replace with a database in production)
-knowledge_bases: dict[str, dict] = {}
+# Custom CollectorRegistry for metrics
+metrics_registry = CollectorRegistry()
 
 @app.on_event("startup")
 async def startup_event():
@@ -52,14 +40,36 @@ async def startup_event():
         # Start Prometheus metrics server in a separate thread
         import threading
         from prometheus_client import start_http_server
-        threading.Thread(target=start_http_server, args=(PROMETHEUS_PORT,)).start()
+        threading.Thread(target=start_http_server, args=(PROMETHEUS_PORT,), daemon=True).start()
+    
+    # Initialize metrics in the registry
+    global requests, response_time, perf_logger
+    requests = Counter("api_requests_total", "Total API requests by endpoint", ["endpoint"], registry=metrics_registry)
+    response_time = Histogram("api_response_time_seconds", "API response time in seconds by endpoint", ["endpoint"], registry=metrics_registry)
+    perf_logger = PerformanceLogger()
+    
     # Initialize rate limiting
     await FastAPILimiter.init(app)
 
 @app.get("/metrics")
 async def metrics():
     """Expose Prometheus metrics for monitoring."""
-    return StreamingResponse(generate_latest(), media_type="text/plain")
+    return StreamingResponse(generate_latest(registry=metrics_registry), media_type="text/plain")
+
+class ChatMessage(BaseModel):
+    message: str
+    document_path: Optional[str] = None
+    knowledge_base_id: Optional[str] = None
+    database_connection: Optional[str] = None
+    feedback: Optional[str] = None
+
+class KnowledgeBaseEntry(BaseModel):
+    id: str
+    paths: List[str] = []  # PDF paths
+    databases: List[str] = []  # Database connection strings
+
+# In-memory storage for knowledge base (replace with a database in production)
+knowledge_bases: dict[str, dict] = {}
 
 @app.post("/knowledge_base")
 async def create_knowledge_base(entries: List[KnowledgeBaseEntry]):
@@ -80,6 +90,7 @@ async def create_knowledge_base(entries: List[KnowledgeBaseEntry]):
                     documents=parsed["documents"]
                 )
                 await rag_agent.graph.ainvoke(rag_state)
+    await AsyncLogger.info(f"Knowledge base created/updated for IDs: {[entry.id for entry in entries]}")
     return {"message": "Knowledge base created/updated", "id": [entry.id for entry in entries]}
 
 @app.post("/upload_and_query", dependencies=[Depends(RateLimiter(times=5, minutes=1))])
@@ -103,8 +114,8 @@ async def upload_and_query(file: UploadFile = File(...), question: Optional[str]
         )
         result = await router.graph.ainvoke(state)
         await AsyncLogger.info(f"Processed query for {file.filename}: {result['result']}")
-        await perf_logger.async_stop("upload_and_query")
         requests.labels(endpoint="upload_and_query").inc()
+        await perf_logger.async_stop("upload_and_query")
         return result["result"]
     except Exception as e:
         await AsyncLogger.error(f"Error processing upload_and_query: {e}")
@@ -140,8 +151,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"end": True})
             
             await stream_response()
-            await perf_logger.async_stop("chat_endpoint")
             requests.labels(endpoint="chat").inc()
+            await perf_logger.async_stop("chat_endpoint")
     except Exception as e:
         await AsyncLogger.error(f"Error in chat endpoint: {e}")
         await websocket.send_json({"error": str(e)})
