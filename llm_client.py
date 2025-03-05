@@ -9,6 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from sentence_transformers import SentenceTransformer
 from transformers import CLIPProcessor, CLIPModel
 import torch
+from langchain_openai import ChatOpenAI  # Added for ChatOpenAI support
 
 # Set log level from config
 logger.remove()
@@ -16,15 +17,15 @@ logger.add(lambda msg: print(msg), level=LOG_LEVEL, format="{time} {level} {mess
 
 class LLMClient:
     """
-    A client for interacting with LLMs, supporting both Phoenix API endpoints and local models,
-    with multimodal capabilities (text and image processing).
+    A client for interacting with LLMs, supporting both Phoenix API endpoints (via requests or ChatOpenAI),
+    and local models, with multimodal capabilities (text and image processing).
     """
     def __init__(self, endpoint_type: str = "default", workspace_a: str = "nb", workspace_b: str = "km74h"):
         """
         Initialize the LLMClient with configurable endpoint type and workspace parameters.
         
         Args:
-            endpoint_type (str): Type of endpoint to use ("default" for standard Phoenix, "phoenix_alt" for the alternate Phoenix endpoint from the image).
+            endpoint_type (str): Type of endpoint to use ("default" for standard Phoenix, "phoenix_alt" for the alternate Phoenix endpoint using ChatOpenAI).
             workspace_a (str): Workspace parameter 'a' for the alternate Phoenix endpoint (default: "nb").
             workspace_b (str): Workspace parameter 'b' for the alternate Phoenix endpoint (default: "km74h").
         """
@@ -35,16 +36,24 @@ class LLMClient:
         if self.endpoint_type == "default":
             self.base_url = LLM_ENDPOINT  # Standard Phoenix endpoint (e.g., /v1/chat/completions)
             self.model = MODEL_NAME_API
+            self.headers = {
+                "Authorization": f"Bearer {TOKEN}",
+                "Content-Type": "application/json"
+            }
         elif self.endpoint_type == "phoenix_alt":
             self.base_url = "http://1rche002papd.sdi.corp.bankofamerica.com:8123/v1"  # Alternate Phoenix endpoint from image
             self.model = f"/phoenix/workspaces/{workspace_a}/{workspace_b}/llama3.3-4bit-awq"
+            # Initialize ChatOpenAI for the alternate endpoint
+            self.chat_llm = ChatOpenAI(
+                base_url=self.base_url,
+                api_key=TOKEN,  # Using TOKEN as the API key (adjust if Phoenix requires a different format)
+                model=self.model,
+                max_tokens=MAX_LENGTH,
+                temperature=TEMPERATURE,
+                top_p=TOP_P
+            )
         else:
             raise ValueError(f"Unknown endpoint_type: {endpoint_type}. Use 'default' or 'phoenix_alt'.")
-        
-        self.headers = {
-            "Authorization": f"Bearer {TOKEN}",
-            "Content-Type": "application/json"
-        }
         
         # Local model setup
         if self.mode == "local":
@@ -78,31 +87,44 @@ class LLMClient:
         start_time = time.time()
         try:
             if self.mode == "api":
-                payload = {
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_length,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "stop": stop
-                }
-                if image_base64 and self.endpoint_type == "default":
-                    # Add image context for default Phoenix endpoint (assuming it supports multimodal input)
-                    payload["image"] = image_base64
-                
-                response = await asyncio.to_thread(
-                    requests.post,
-                    self.base_url,
-                    headers=self.headers,
-                    data=json.dumps(payload),
-                    timeout=30
-                )
-                response.raise_for_status()
-                response_data = response.json()
-                answer = response_data.get("choices", [{}])[0].get("message", {}).get("content", "No response received")
+                if self.endpoint_type == "default":
+                    payload = {
+                        "model": self.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_length,
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "stop": stop
+                    }
+                    if image_base64:
+                        payload["image"] = image_base64
+                    
+                    response = await asyncio.to_thread(
+                        requests.post,
+                        self.base_url,
+                        headers=self.headers,
+                        data=json.dumps(payload),
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    response_data = response.json()
+                    answer = response_data.get("choices", [{}])[0].get("message", {}).get("content", "No response received")
+                else:  # phoenix_alt using ChatOpenAI
+                    if image_base64:
+                        # Process image for multimodal input (simplified; adjust based on ChatOpenAI support)
+                        image_description = await self.process_image(image_base64)
+                        prompt = f"{prompt}\nImage description: {image_description}"
+                    response = await asyncio.to_thread(
+                        self.chat_llm.invoke,
+                        prompt,
+                        max_tokens=max_length,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop
+                    )
+                    answer = response.content if hasattr(response, "content") else str(response)
             else:  # Local mode
                 if image_base64:
-                    # Process image for multimodal input
                     image = await asyncio.to_thread(self.image_processor.decode_base64_to_pil, image_base64)
                     image_inputs = self.image_processor(images=image, return_tensors="pt").to(DEVICE)
                     image_features = self.image_model.get_image_features(**image_inputs).detach().cpu().numpy()[0]
@@ -140,36 +162,54 @@ class LLMClient:
         start_time = time.time()
         try:
             if self.mode == "api":
-                payload = {
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": MAX_LENGTH,
-                    "temperature": TEMPERATURE,
-                    "top_p": TOP_P,
-                    "stream": True
-                }
-                if image_base64 and self.endpoint_type == "default":
-                    payload["image"] = image_base64
-                
-                response = await asyncio.to_thread(
-                    requests.post,
-                    self.base_url,
-                    headers=self.headers,
-                    data=json.dumps(payload),
-                    timeout=30,
-                    stream=True
-                )
-                response.raise_for_status()
-                
-                for line in response.iter_lines():
-                    if line:
-                        decoded_line = line.decode("utf-8").replace("data: ", "")
-                        if decoded_line == "[DONE]":
-                            break
-                        data = json.loads(decoded_line)
-                        token = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                if self.endpoint_type == "default":
+                    payload = {
+                        "model": self.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": MAX_LENGTH,
+                        "temperature": TEMPERATURE,
+                        "top_p": TOP_P,
+                        "stream": True
+                    }
+                    if image_base64:
+                        payload["image"] = image_base64
+                    
+                    response = await asyncio.to_thread(
+                        requests.post,
+                        self.base_url,
+                        headers=self.headers,
+                        data=json.dumps(payload),
+                        timeout=30,
+                        stream=True
+                    )
+                    response.raise_for_status()
+                    
+                    for line in response.iter_lines():
+                        if line:
+                            decoded_line = line.decode("utf-8").replace("data: ", "")
+                            if decoded_line == "[DONE]":
+                                break
+                            data = json.loads(decoded_line)
+                            token = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if token:
+                                yield token
+                else:  # phoenix_alt using ChatOpenAI
+                    if image_base64:
+                        image_description = await self.process_image(image_base64)
+                        prompt = f"{prompt}\nImage description: {image_description}"
+                    # Simulate streaming for ChatOpenAI (adjust based on actual streaming support)
+                    response = await asyncio.to_thread(
+                        self.chat_llm.stream,
+                        prompt,
+                        max_tokens=MAX_LENGTH,
+                        temperature=TEMPERATURE,
+                        top_p=TOP_P
+                    )
+                    for chunk in response:
+                        token = chunk.content if hasattr(chunk, "content") else str(chunk)
                         if token:
                             yield token
+                            await asyncio.sleep(0.01)  # Simulate streaming delay
             else:  # Local mode
                 if image_base64:
                     image = await asyncio.to_thread(self.image_processor.decode_base64_to_pil, image_base64)
@@ -210,8 +250,38 @@ class LLMClient:
         start_time = time.time()
         prompt = f"Classify the following text into one of these labels: {', '.join(labels)}. Text: {text}\nReturn a JSON object with scores for each label (0-1)."
         try:
-            response = await self.generate(prompt, max_length=100)
-            scores = json.loads(response)
+            if self.mode == "api":
+                if self.endpoint_type == "default":
+                    payload = {
+                        "model": self.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 100,
+                        "temperature": 0.1,
+                        "top_p": 0.9
+                    }
+                    response = await asyncio.to_thread(
+                        requests.post,
+                        self.base_url,
+                        headers=self.headers,
+                        data=json.dumps(payload),
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    response_data = response.json()
+                    scores = json.loads(response_data.get("choices", [{}])[0].get("message", {}).get("content", "{}"))
+                else:  # phoenix_alt using ChatOpenAI
+                    response = await asyncio.to_thread(
+                        self.chat_llm.invoke,
+                        prompt,
+                        max_tokens=100,
+                        temperature=0.1,
+                        top_p=0.9
+                    )
+                    scores = json.loads(response.content if hasattr(response, "content") else str(response))
+            else:  # Local mode
+                response = self.text_pipeline(prompt, max_length=100, temperature=0.1, top_p=0.9)[0]["generated_text"]
+                scores = json.loads(response)
+            
             duration = time.time() - start_time
             await AsyncLogger.info(f"Classified text in {duration:.2f} seconds: {text[:50]}{'...' if len(text) > 50 else ''}")
             return scores
@@ -236,24 +306,34 @@ class LLMClient:
             image_features = self.image_model.get_image_features(**inputs).detach().cpu().numpy()[0]
             
             prompt = "Describe this image: [Image features included]"
-            if self.mode == "api" and self.endpoint_type == "default":
-                payload = {
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 100,
-                    "temperature": TEMPERATURE,
-                    "top_p": TOP_P
-                }
-                response = await asyncio.to_thread(
-                    requests.post,
-                    self.base_url,
-                    headers=self.headers,
-                    data=json.dumps(payload),
-                    timeout=30
-                )
-                response.raise_for_status()
-                response_data = response.json()
-                description = response_data.get("choices", [{}])[0].get("message", {}).get("content", "No description available")
+            if self.mode == "api":
+                if self.endpoint_type == "default":
+                    payload = {
+                        "model": self.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 100,
+                        "temperature": TEMPERATURE,
+                        "top_p": TOP_P
+                    }
+                    response = await asyncio.to_thread(
+                        requests.post,
+                        self.base_url,
+                        headers=self.headers,
+                        data=json.dumps(payload),
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    response_data = response.json()
+                    description = response_data.get("choices", [{}])[0].get("message", {}).get("content", "No description available")
+                else:  # phoenix_alt using ChatOpenAI
+                    response = await asyncio.to_thread(
+                        self.chat_llm.invoke,
+                        prompt,
+                        max_tokens=100,
+                        temperature=TEMPERATURE,
+                        top_p=TOP_P
+                    )
+                    description = response.content if hasattr(response, "content") else str(response)
             else:  # Local mode
                 description = self.text_pipeline(
                     prompt,
