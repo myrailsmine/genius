@@ -5,9 +5,10 @@ from transformers import CLIPProcessor, CLIPModel
 from typing import List, Optional, AsyncGenerator
 from langchain_core.documents import Document
 import asyncio
-from utils.logger import PerformanceLogger, AsyncLogger
+from utils.logger import AsyncLogger
 from utils.config import EMBED_MODEL, RETRIEVAL_K, DEVICE, LOG_LEVEL
-from document_ai_agents.logger import logger
+from utils.image_utils import base64_to_pil_image
+from utils.llm_client import LLMClient
 import time
 
 # Set log level from config
@@ -31,7 +32,6 @@ class MultimodalRetriever:
         """
         self.documents = documents
         self.k = k
-        self.perf_logger = PerformanceLogger()
         
         # Initialize text embedding model
         self.text_embedder = embedder or SentenceTransformer(EMBED_MODEL)
@@ -77,7 +77,6 @@ class MultimodalRetriever:
         Returns:
             List[Document]: List of relevant documents (text and images), sorted by relevance.
         """
-        self.perf_logger.start()
         start_time = time.time()
         try:
             # Text retrieval (dense + sparse)
@@ -108,7 +107,6 @@ class MultimodalRetriever:
 
             duration = time.time() - start_time
             await AsyncLogger.info(f"Retrieved {len(result)} documents in {duration:.2f} seconds for query: {query}")
-            await self.perf_logger.async_stop("multimodal_retriever")
             return result
         except Exception as e:
             await AsyncLogger.error(f"Error in retrieval for query {query}: {e}")
