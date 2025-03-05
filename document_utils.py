@@ -1,10 +1,11 @@
 import tempfile
 from pdf2image import convert_from_bytes
 from pypdf import PdfReader
-from document_ai_agents.logger import logger
-import asyncio
+from PIL import Image
 from typing import List
 from pathlib import Path
+from utils.logger import logger, AsyncLogger
+import asyncio
 
 def extract_images_from_pdf(pdf_path: str) -> List[Image.Image]:
     """
