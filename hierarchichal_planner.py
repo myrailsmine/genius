@@ -17,36 +17,21 @@ from agents.document_parsing_agent import DocumentLayoutParsingState
 from agents.new_agent import NewAgentState
 
 class HierarchicalPlanner:
-    """
-    A utility class for generating and optimizing hierarchical task plans with ReAct reasoning,
-    supporting multimodal inputs, asynchronous processing, and team execution.
-    """
     def __init__(self, llm_client: LLMClient = None, communicator: AgentCommunicator = None, toolkit: ToolKit = None, memory_store: MemoryStore = None):
         self.llm_client = llm_client or LLMClient()
         self.communicator = communicator or AgentCommunicator()
         self.toolkit = toolkit or ToolKit()
         self.memory_store = memory_store or MemoryStore()
-        self.reasoning_cache = {}  # Cache for intermediate reasoning steps
+        self.reasoning_cache = {}
+        self.human_review_timeout = 60  # Seconds to wait for human response
 
     async def reasoning_loop(self, query: str, multimodal_context: Optional[dict] = None, max_steps: int = 5) -> List[Dict]:
-        """
-        Implement ReAct-style reasoning: iterate between reasoning and acting to refine the plan.
-
-        Args:
-            query (str): The user query to reason about.
-            multimodal_context (Optional[dict]): Multimodal input for context.
-            max_steps (int): Maximum reasoning steps to prevent infinite loops.
-
-        Returns:
-            List[Dict]: List of reasoning steps with actions and observations.
-        """
         steps = []
         current_state = query
         text_context = "\n".join(multimodal_context.get("text", [])[:500]) if multimodal_context and "text" in multimodal_context else ""
         image_context = "\n".join([await asyncio.to_thread(self.llm_client.process_image, img) for img in multimodal_context.get("images", [])[:5]]) if multimodal_context and "images" in multimodal_context else ""
 
         for step in range(max_steps):
-            # Step 1: Reason - Generate a reasoning step
             prompt = (
                 f"Current state: {current_state}\n"
                 f"Text Context: {text_context}\n"
@@ -66,7 +51,6 @@ class HierarchicalPlanner:
             steps.append(reasoning_step)
             current_state = reasoning_step["next_state"]
 
-            # Step 2: Act - Execute the action
             action = reasoning_step["action"]
             if "retrieve" in action.lower():
                 documents = await self.toolkit.search_web(current_state) if "web" in action.lower() else []
@@ -76,12 +60,10 @@ class HierarchicalPlanner:
             else:
                 observation = "No action taken"
 
-            # Update state with observation
             steps[-1]["observation"] = observation
             current_state = f"{current_state}\nObservation: {observation}"
 
-            # Step 3: Check termination
-            if "complete" in reasoning_step["action"].lower() or step == max_steps - 1:
+            if "complete" in action.lower() or step == max_steps - 1:
                 break
 
         self.reasoning_cache[query] = steps
@@ -89,21 +71,10 @@ class HierarchicalPlanner:
         return steps
 
     async def plan_task(self, query: str, multimodal_context: Optional[dict] = None) -> List[Dict]:
-        """
-        Generate a hierarchical task plan with ReAct reasoning steps.
-
-        Args:
-            query (str): The user query or task to break down.
-            multimodal_context (Optional[dict]): Dictionary with 'text' and 'images' (base64 strings) for multimodal input.
-
-        Returns:
-            List[Dict]: List of tasks with 'agent', 'subtask', 'priority', and 'reasoning_steps'.
-        """
         await AsyncLogger.info(f"Planning task for query: {query}")
         text_context = "\n".join(multimodal_context.get("text", [])[:500]) if multimodal_context and "text" in multimodal_context else ""
         image_context = "\n".join([await asyncio.to_thread(self.llm_client.process_image, img) for img in multimodal_context.get("images", [])[:5]]) if multimodal_context and "images" in multimodal_context else ""
 
-        # Check memory for past reasoning
         past_reasoning = await self.memory_store.retrieve_memory(f"reasoning_{query}")
         if past_reasoning:
             await AsyncLogger.info(f"Using cached reasoning for query: {query}")
@@ -111,7 +82,6 @@ class HierarchicalPlanner:
         else:
             reasoning_steps = await self.reasoning_loop(query, multimodal_context)
 
-        # Only generate a plan if the query is complex or long enough
         if len(query.split()) <= PLANNING_THRESHOLD and not any(keyword in query.lower() for keyword in ["plan", "break down", "steps", "multimodal"]):
             await AsyncLogger.info(f"Query too simple for planning: {query}")
             return [{"agent": "rag_agent", "subtask": query, "priority": 5, "reasoning_steps": reasoning_steps}]
@@ -135,10 +105,9 @@ class HierarchicalPlanner:
             plan = json.loads(response)
             if not isinstance(plan, list) or not all("agent" in task and "subtask" in task and "priority" in task for task in plan):
                 raise ValueError("Invalid plan format: must be a list of tasks with 'agent', 'subtask', and 'priority'")
-            # Validate and normalize priorities
             for task in plan:
                 if not isinstance(task["priority"], int) or not (0 <= task["priority"] <= 10):
-                    task["priority"] = 5  # Default priority if invalid
+                    task["priority"] = 5
                 task["reasoning_steps"] = reasoning_steps
             await AsyncLogger.info(f"Generated plan in {duration:.2f} seconds: {plan}")
             return plan
@@ -147,9 +116,6 @@ class HierarchicalPlanner:
             return [{"agent": "rag_agent", "subtask": query, "priority": 5, "reasoning_steps": reasoning_steps}]
 
     async def optimize_plan(self, plan: List[Dict], multimodal_context: Optional[dict] = None) -> List[Dict]:
-        """
-        Optimize a hierarchical task plan for efficiency, preserving reasoning steps.
-        """
         await AsyncLogger.info(f"Optimizing plan: {plan}")
         text_context = "\n".join(multimodal_context.get("text", [])[:500]) if multimodal_context and "text" in multimodal_context else ""
         image_context = "\n".join([await asyncio.to_thread(self.llm_client.process_image, img) for img in multimodal_context.get("images", [])[:5]]) if multimodal_context and "images" in multimodal_context else ""
@@ -214,18 +180,57 @@ class HierarchicalPlanner:
                 return False
         return True
 
-    async def execute_plan(self, plan: List[Dict], team: AgentTeam, parallel_tasks: bool = False) -> List[str]:
+    async def human_review(self, task: Dict, team: AgentTeam) -> bool:
+        """
+        Request human review for a task via communicator.
+
+        Args:
+            task (Dict): The task requiring human review.
+            team (AgentTeam): The team executing the plan.
+
+        Returns:
+            bool: True if approved, False if rejected or timed out.
+        """
+        await AsyncLogger.info(f"Requesting human review for task: {task['subtask']}")
+        await self.communicator.send_message("hierarchical_planner", "human", f"Review required for task: {task['subtask']}. Approve? (yes/no)", {"task": task})
+
+        start_time = time.time()
+        while time.time() - start_time < self.human_review_timeout:
+            messages = await self.communicator.receive_messages("hierarchical_planner")
+            for msg in messages:
+                if msg.sender == "human" and "yes" in msg.content.lower():
+                    await AsyncLogger.info(f"Human approved task: {task['subtask']}")
+                    return True
+                elif msg.sender == "human" and "no" in msg.content.lower():
+                    await AsyncLogger.info(f"Human rejected task: {task['subtask']}")
+                    return False
+            await asyncio.sleep(1)
+
+        await AsyncLogger.warning(f"Human review timed out for task: {task['subtask']}")
+        return False
+
+    async def execute_plan(self, plan: List[Dict], team: AgentTeam, parallel_tasks: bool = False, require_human_review: bool = False) -> List[str]:
         if not await self.validate_plan(plan):
             await AsyncLogger.error("Invalid plan, execution aborted")
             return ["Plan validation failed"]
 
-        await AsyncLogger.info(f"Executing plan with {len(plan)} tasks (parallel: {parallel_tasks})")
+        await AsyncLogger.info(f"Executing plan with {len(plan)} tasks (parallel: {parallel_tasks}, human review: {require_human_review})")
         results = []
         if parallel_tasks:
-            tasks = [self._execute_task(task, team) for task in sorted(plan, key=lambda x: x["priority"], reverse=True)]
-            results = await asyncio.gather(*tasks)
+            tasks = []
+            for task in sorted(plan, key=lambda x: x["priority"], reverse=True):
+                if require_human_review and task["priority"] > 8:
+                    if not await self.human_review(task, team):
+                        results.append(f"Task {task['subtask']} rejected by human")
+                        continue
+                tasks.append(self._execute_task(task, team))
+            results.extend(await asyncio.gather(*tasks))
         else:
             for task in sorted(plan, key=lambda x: x["priority"], reverse=True):
+                if require_human_review and task["priority"] > 8:
+                    if not await self.human_review(task, team):
+                        results.append(f"Task {task['subtask']} rejected by human")
+                        continue
                 result = await self._execute_task(task, team)
                 results.append(result)
         return results
@@ -241,18 +246,28 @@ class HierarchicalPlanner:
         await self.memory_store.store_memory(f"task_{task['subtask']}", {"result": task_result, "task": task, "timestamp": time.time()})
         return task_result
 
-    async def execute_plan_stream(self, plan: List[Dict], team: AgentTeam, parallel_tasks: bool = False) -> AsyncGenerator[str, None]:
+    async def execute_plan_stream(self, plan: List[Dict], team: AgentTeam, parallel_tasks: bool = False, require_human_review: bool = False) -> AsyncGenerator[str, None]:
         if not await self.validate_plan(plan):
             yield "Invalid plan, execution aborted\n"
             return
 
-        await AsyncLogger.info(f"Streaming execution of plan with {len(plan)} tasks (parallel: {parallel_tasks})")
+        await AsyncLogger.info(f"Streaming execution of plan with {len(plan)} tasks (parallel: {parallel_tasks}, human review: {require_human_review})")
         if parallel_tasks:
-            tasks = [(task, team) for task in sorted(plan, key=lambda x: x["priority"], reverse=True)]
+            tasks = []
+            for task in sorted(plan, key=lambda x: x["priority"], reverse=True):
+                if require_human_review and task["priority"] > 8:
+                    if not await self.human_review(task, team):
+                        yield f"Task {task['subtask']} rejected by human\n"
+                        continue
+                tasks.append((task, team))
             async for token in self._execute_parallel_stream(tasks):
                 yield token
         else:
             for task in sorted(plan, key=lambda x: x["priority"], reverse=True):
+                if require_human_review and task["priority"] > 8:
+                    if not await self.human_review(task, team):
+                        yield f"Task {task['subtask']} rejected by human\n"
+                        continue
                 yield f"Executing sub-task: {task['subtask']} with {task['agent']} (Priority: {task['priority']})\n"
                 async for token in self._execute_task_stream(task, team):
                     yield token
