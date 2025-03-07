@@ -1,110 +1,73 @@
-from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field
-from typing import Optional, List, AsyncGenerator
-from langchain_core.documents import Document
-from hybrid_retriever import MultimodalRetriever
+from langgraph.graph import StateGraph, END
 from utils.llm_client import LLMClient
-from utils.config import LOG_LEVEL, MAX_LENGTH, TEMPERATURE, TOP_P, STOP_SEQUENCES
-from utils.logger import logger, AsyncLogger
+from utils.hybrid_retriever import MultimodalRetriever
+from utils.config import RETRIEVAL_K
+from utils.logger import AsyncLogger
+from utils.agent_communication import AgentMessage
+from agent_registry import AgentRegistry
 import asyncio
-from agent_registry import agent_registry  # Added import for agent_registry
 
-# Set log level from config
-from loguru import logger
-logger.remove()
-logger.add(lambda msg: print(msg), level=LOG_LEVEL, format="{time} {level} {message}")
+class DocumentRAGState:
+    def __init__(self, question=None, document_path=None, pages_as_base64_jpeg_images=None, pages_as_text=None, documents=None, summarize=False, messages=None, multimodal_context=None):
+        self.question = question
+        self.document_path = document_path
+        self.pages_as_base64_jpeg_images = pages_as_base64_jpeg_images or []
+        self.pages_as_text = pages_as_text or []
+        self.documents = documents or []
+        self.summarize = summarize
+        self.messages = messages or []
+        self.multimodal_context = multimodal_context or {"text": [], "images": []}
+        self.result = {}
 
-class DocumentRAGState(BaseModel):
-    question: str
-    document_path: Optional[str] = None
-    pages_as_base64_jpeg_images: list[str] = Field(default_factory=list)
-    pages_as_text: list[str] = Field(default_factory=list)
-    documents: list[Document] = Field(default_factory=list)
-    relevant_documents: list[Document] = Field(default_factory=list)
-    response: Optional[str] = None
-    knowledge_base_id: Optional[str] = None
-
-@agent_registry.register(
-    name="rag_agent",
-    capabilities=["qa"],
-    supported_doc_types=["generic"]
-)
 class DocumentRAGAgent:
-    def __init__(self, embed_model="all-MiniLM-L6-v2", k=3):
+    def __init__(self):
         self.llm_client = LLMClient()
-        self.embedder = SentenceTransformer(embed_model)
-        self.retriever = None
-        self.k = k
-        self.graph = self.build_agent()
+        self.retriever = MultimodalRetriever([])
+        self.graph = StateGraph(DocumentRAGState)
+        self._build_graph()
 
-    async def index_documents(self, state: DocumentRAGState):
-        if state.knowledge_base_id:
-            from api import knowledge_bases
-            all_documents = []
-            tasks = []
-            for path in knowledge_bases.get(state.knowledge_base_id, {}).get("paths", []):
-                if Path(path).is_file() and path.endswith('.pdf'):
-                    task = asyncio.create_task(self.process_single_document(path))
-                    tasks.append(task)
-            results = await asyncio.gather(*tasks)
-            all_documents = [doc for result in results for doc in result]
-            state.documents = all_documents
-        elif state.document_path and Path(state.document_path).is_file() and state.document_path.endswith('.pdf'):
-            parser = agent_registry.get_agent("parsing_agent")()
-            parse_state = DocumentLayoutParsingState(document_path=state.document_path)
-            parsed = await parser.graph.ainvoke(parse_state)
-            state.documents = parsed["documents"]
-            state.pages_as_base64_jpeg_images = parsed["pages_as_base64_jpeg_images"]
-            state.pages_as_text = parsed["pages_as_text"]
-        self.retriever = MultimodalRetriever(state.documents, embedder=self.embedder, k=self.k)
+    def _build_graph(self):
+        self.graph.add_node("retrieve", self.retrieve)
+        self.graph.add_node("answer", self.answer)
+        self.graph.add_node("stream_answer", self.stream_answer)
+        self.graph.set_entry_point("retrieve")
+        self.graph.add_edge("retrieve", "answer")
+        self.graph.add_edge("answer", END)
+        self.graph.add_edge("stream_answer", END)
 
-    async def process_single_document(self, path: str):
-        parser = agent_registry.get_agent("parsing_agent")()
-        parse_state = DocumentLayoutParsingState(document_path=path)
-        parsed = await parser.graph.ainvoke(parse_state)
-        return parsed["documents"]
+    async def retrieve(self, state: DocumentRAGState):
+        documents = await self.retriever.retrieve(state.question or "Summarize this document" if state.summarize else "")
+        state.documents = documents
+        if state.messages:
+            for msg in state.messages:
+                if msg.sender != self.__class__.__name__:
+                    await self.process_message(msg)
+        return state
 
-    async def answer_question(self, state: DocumentRAGState) -> dict:
-        relevant_docs = await asyncio.to_thread(self.retriever.retrieve, state.question)
-        text_context = "\n".join([doc.page_content for doc in relevant_docs if "Text-block" in doc.metadata.get("element_type", "")])
-        image_context = "\n".join([await asyncio.to_thread(self.llm_client.process_image, doc.metadata.get("image_base64", "")) for doc in relevant_docs if "Image" in doc.metadata.get("element_type", "")])
-        
-        # Use agentic reasoning for structured response
-        prompt = (
-            f"Question: {state.question}\n"
-            f"Text Context: {text_context}\n"
-            f"Image Context: {image_context}\n"
-            "Provide a detailed answer, considering both text and image information:"
-        )
-        response = await asyncio.to_thread(self.llm_client.generate, prompt, image_base64=None if not state.pages_as_base64_jpeg_images else state.pages_as_base64_jpeg_images[0])
-        state.response = response
-        return {"response": response, "relevant_documents": relevant_docs}
+    async def answer(self, state: DocumentRAGState):
+        context = " ".join([doc.page_content for doc in state.documents])
+        prompt = f"{state.question}\nContext: {context}" if state.question else f"Summarize: {context}"
+        state.result["response"] = await self.llm_client.generate(prompt)
+        return state
 
-    async def stream_answer(self, state: DocumentRAGState) -> AsyncGenerator[str, None]:
-        """Stream the RAG response token by token for real-time chat."""
-        relevant_docs = await asyncio.to_thread(self.retriever.retrieve, state.question)
-        text_context = "\n".join([doc.page_content for doc in relevant_docs if "Text-block" in doc.metadata.get("element_type", "")])
-        image_context = "\n".join([await asyncio.to_thread(self.llm_client.process_image, doc.metadata.get("image_base64", "")) for doc in relevant_docs if "Image" in doc.metadata.get("element_type", "")])
-        
-        prompt = (
-            f"Question: {state.question}\n"
-            f"Text Context: {text_context}\n"
-            f"Image Context: {image_context}\n"
-            "Answer:"
-        )
-        async for token in self.llm_client.generate_stream(prompt, image_base64=None if not state.pages_as_base64_jpeg_images else state.pages_as_base64_jpeg_images[0]):
+    async def stream_answer(self, state: DocumentRAGState):
+        context = " ".join([doc.page_content for doc in state.documents])
+        prompt = f"{state.question}\nContext: {context}" if state.question else f"Summarize: {context}"
+        async for token in self.llm_client.generate_stream(prompt):
             yield token
 
-    def build_agent(self):
-        builder = StateGraph(DocumentRAGState)
-        builder.add_node("index_documents", self.index_documents)
-        builder.add_node("answer_question", self.answer_question)
-        builder.add_node("stream_answer", self.stream_answer)
-        builder.add_edge(START, "index_documents")
-        builder.add_edge("index_documents", "answer_question")
-        builder.add_conditional_edges(
-            "answer_question",
-            lambda x: "stream_answer" if x.response else END,
-            path_map={"stream_answer": END}
-        )
-        return builder.compile()
+    async def process_message(self, message: AgentMessage):
+        await AsyncLogger.info(f"Received message from {message.sender}: {message.content}")
+        if "update" in message.content.lower():
+            await self.update_strategy(message.content)
+        return await self.llm_client.generate(f"Processed: {message.content}")
+
+    async def update_strategy(self, improvement: str):
+        await AsyncLogger.info(f"Updating strategy with: {improvement}")
+        # Hypothetical logic to adjust retrieval or prompts
+        if "increase retrieval" in improvement.lower():
+            self.retriever.k = min(self.retriever.k + 1, 10)
+
+    async def graph(self, state: DocumentRAGState, start_node=None):
+        async for event in self.graph.stream(state, start_node=start_node):
+            yield event
