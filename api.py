@@ -1,23 +1,32 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, HTTPException
+from fastapi import FastAPI, UploadFile, File, WebSocket, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import asyncio
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, List, Dict
 from agents.router_agent import RouterState, RouterAgent
 from agents.document_rag_agent import DocumentRAGState, DocumentRAGAgent
 from agents.document_parsing_agent import DocumentLayoutParsingState, DocumentParsingAgent
 from pathlib import Path
 import os
 from utils.logger import AsyncLogger
-from utils.config import API_HOST, API_PORT, WEBSOCKET_URL, LOG_LEVEL
+from utils.config import API_HOST, API_PORT, WEBSOCKET_URL, LOG_LEVEL, ENDPOINT_TYPE, WORKSPACE_A, WORKSPACE_B, PLANNING_THRESHOLD, REFLECTION_ENABLED
+from utils.llm_client import LLMClient
+from utils.agent_team import AgentTeam
+from utils.hierarchical_planner import HierarchicalPlanner
+from utils.reflective_agent import ReflectiveAgent
+from utils.agent_communication import AgentCommunicator
+from utils.tools import ToolKit
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+from agent_registry import AgentRegistry
+import time
 
 # Custom lifespan for FastAPI
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.communicator = AgentCommunicator()
+    app.state.toolkit = ToolKit()
     yield
-    # No startup/shutdown tasks needed for now
 
 app = FastAPI(title="Agentic RAG Framework API", version="0.1.0", lifespan=lifespan)
 
@@ -57,10 +66,10 @@ async def create_knowledge_base(entries: List[KnowledgeBaseEntry]):
         knowledge_bases[entry.id] = {"paths": entry.paths, "databases": entry.databases}
         for path in entry.paths:
             if Path(path).is_file() and path.endswith('.pdf'):
-                parser = agent_registry.get_agent("parsing_agent")()
+                parser = AgentRegistry.get_agent("parsing_agent")()
                 state = DocumentLayoutParsingState(document_path=str(Path(path)))
                 parsed = await parser.graph.ainvoke(state)
-                rag_agent = agent_registry.get_agent("rag_agent")()
+                rag_agent = AgentRegistry.get_agent("rag_agent")()
                 rag_state = DocumentRAGState(
                     question="Initialize knowledge base",
                     document_path=str(Path(path)),
@@ -73,7 +82,7 @@ async def create_knowledge_base(entries: List[KnowledgeBaseEntry]):
     return {"message": "Knowledge base created/updated", "id": [entry.id for entry in entries]}
 
 @app.post("/upload_and_query")
-async def upload_and_query(file: UploadFile = File(...), question: Optional[str] = None, summarize: bool = False, database_connection: Optional[str] = None):
+async def upload_and_query(file: UploadFile = File(...), question: Optional[str] = None, summarize: bool = False, team_mode: bool = False, background_tasks: BackgroundTasks = None):
     """Upload a PDF and process a QA or summarization query with optional database integration."""
     if not question and not summarize:
         raise HTTPException(status_code=400, detail="Question or summarize flag is required")
@@ -84,18 +93,47 @@ async def upload_and_query(file: UploadFile = File(...), question: Optional[str]
         with open(file_path, "wb") as f:
             await f.write(await file.read())
         
-        router = agent_registry.get_agent("router_agent")()
-        state = RouterState(
-            document_path=file_path,
-            query=question,
-            summarize=summarize,
-            database_connection=database_connection
-        )
-        result = await router.graph.ainvoke(state)
-        await AsyncLogger.info(f"Processed query for {file.filename}: {result['result']}")
+        llm_client = LLMClient(endpoint_type=ENDPOINT_TYPE, workspace_a=WORKSPACE_A, workspace_b=WORKSPACE_B)
+        planner = HierarchicalPlanner(llm_client, app.state.communicator, app.state.toolkit)
+        communicator = app.state.communicator
+        toolkit = app.state.toolkit
+        reflective_agent = ReflectiveAgent(llm_client, communicator)
+
+        multimodal_context = {"text": [f"File: {file.filename}"], "images": []} if file_path else None
+        if team_mode:
+            team = AgentTeam(["parsing_agent", "rag_agent"], llm_client, communicator, toolkit)
+            if len(question or "") > PLANNING_THRESHOLD:
+                plan = await planner.plan_task(f"Process PDF: {question or 'Summarize'}", multimodal_context)
+                optimized_plan = await planner.optimize_plan(plan, multimodal_context)
+                result = await planner.execute_plan(optimized_plan, team)
+                synthesized = await llm_client.generate(f"Synthesize results: {result}")
+                final_result = {"response": synthesized}
+                if REFLECTION_ENABLED and background_tasks:
+                    background_tasks.add_task(reflective_agent.reflect, question, synthesized, "User feedback", multimodal_context)
+            else:
+                state = {"document_path": file_path, "query": question, "summarize": summarize}
+                result = await team.execute_task(state)
+                final_result = result
+        else:
+            router = AgentRegistry.get_agent("router_agent")()
+            state = RouterState(
+                document_path=file_path,
+                query=question,
+                summarize=summarize,
+                multimodal_context=multimodal_context
+            )
+            result = await router.graph.ainvoke(state)
+            final_result = result["result"]
+
+        if REFLECTION_ENABLED and background_tasks:
+            reflection = await reflective_agent.reflect(question, final_result["response"], "Initial feedback", multimodal_context)
+            refined_strategy = await reflective_agent.apply_improvements(reflection, "Basic response", router)
+            background_tasks.add_task(AsyncLogger.info, f"Refined strategy: {refined_strategy}")
+
+        await AsyncLogger.info(f"Processed query for {file.filename}: {final_result}")
         duration = time.time() - start_time
         await AsyncLogger.info(f"Endpoint /upload_and_query processed in {duration:.2f} seconds")
-        return result["result"]
+        return final_result
     except Exception as e:
         await AsyncLogger.error(f"Error processing upload_and_query: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -112,21 +150,42 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             data = await websocket.receive_json()
             msg = ChatMessage(**data)
-            router = agent_registry.get_agent("router_agent")()
+            llm_client = LLMClient(endpoint_type=ENDPOINT_TYPE, workspace_a=WORKSPACE_A, workspace_b=WORKSPACE_B)
+            communicator = app.state.communicator
+            toolkit = app.state.toolkit
+            router = AgentRegistry.get_agent("router_agent")()
+            reflective_agent = ReflectiveAgent(llm_client, communicator)
+            planner = HierarchicalPlanner(llm_client, communicator, toolkit)
+            multimodal_context = {"text": [msg.message], "images": []} if msg.document_path else None
+
             state = RouterState(
                 document_path=msg.document_path,
                 query=msg.message if "what" in msg.message.lower() or "?" in msg.message else None,
                 summarize="summarize" in msg.message.lower(),
                 knowledge_base_id=msg.knowledge_base_id,
                 database_connection=msg.database_connection,
-                feedback=msg.feedback
+                feedback=msg.feedback,
+                multimodal_context=multimodal_context
             )
             await AsyncLogger.info(f"Received chat message: {msg.message}")
             
             # Stream the response
             async def stream_response():
-                async for token in router.graph.ainvoke(state, start_node="stream_response"):
-                    await websocket.send_text(token)
+                team = AgentTeam(["parsing_agent", "rag_agent"], llm_client, communicator, toolkit) if msg.document_path else None
+                if team and len(msg.message or "") > PLANNING_THRESHOLD:
+                    plan = await planner.plan_task(msg.message, multimodal_context)
+                    async for token in planner.stream_plan(msg.message, multimodal_context):
+                        await websocket.send_text(token)
+                    optimized_plan = await planner.optimize_plan(plan, multimodal_context)
+                    async for token in planner.execute_plan_stream(optimized_plan, team):
+                        await websocket.send_text(token)
+                    result = await planner.execute_plan(optimized_plan, team)
+                    reflection = await reflective_agent.reflect(msg.message, result[0], msg.feedback, multimodal_context)
+                    refined_strategy = await reflective_agent.apply_improvements(reflection, "Chat strategy", router)
+                    await websocket.send_text(f"Reflection applied: {refined_strategy}\n")
+                else:
+                    async for token in router.graph.ainvoke(state, start_node="stream_response"):
+                        await websocket.send_text(token)
                 await websocket.send_json({"end": True})
             
             await stream_response()
@@ -144,13 +203,18 @@ async def submit_feedback(query: str, response: str, rating: int, comment: Optio
     """Submit user feedback for agent improvement."""
     start_time = time.time()
     await AsyncLogger.info(f"Feedback - Query: {query}, Response: {response}, Rating: {rating}, Comment: {comment}")
-    router = agent_registry.get_agent("router_agent")()
-    state = RouterState(query=query, result={"response": response}, feedback=f"Rating: {rating}, Comment: {comment}")
+    llm_client = LLMClient(endpoint_type=ENDPOINT_TYPE, workspace_a=WORKSPACE_A, workspace_b=WORKSPACE_B)
+    reflective_agent = ReflectiveAgent(llm_client, app.state.communicator)
+    multimodal_context = {"text": [query], "images": []}
+    reflection = await reflective_agent.reflect(query, response, f"Rating: {rating}, Comment: {comment}", multimodal_context)
+    router = AgentRegistry.get_agent("router_agent")()
+    state = RouterState(query=query, result={"response": response}, feedback=f"Rating: {rating}, Comment: {comment}", multimodal_context=multimodal_context)
     result = await router.graph.ainvoke(state)
+    refined_strategy = await reflective_agent.apply_improvements(reflection, "Feedback strategy", router)
     duration = time.time() - start_time
     await AsyncLogger.info(f"Endpoint /feedback processed in {duration:.2f} seconds")
-    return {"message": "Feedback received and processed", "reflection": result["result"].get("reflection", {})}
+    return {"message": "Feedback received and processed", "reflection": result["result"].get("reflection", {}), "improvement": refined_strategy}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=API_HOST, port=API_PORT)
+    uvicorn.run(app, host=API_HOST, port=API_PORT, workers=2)  # Enable multiple workers for load balancing
