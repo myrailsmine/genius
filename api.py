@@ -17,7 +17,6 @@ from utils.reflective_agent import ReflectiveAgent
 from utils.agent_communication import AgentCommunicator
 from utils.tools import ToolKit
 from utils.memory_store import MemoryStore
-from utils.performance_monitor import PerformanceMonitor
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from agent_registry import AgentRegistry
@@ -28,7 +27,6 @@ async def lifespan(app: FastAPI):
     app.state.communicator = AgentCommunicator()
     app.state.toolkit = ToolKit()
     app.state.memory_store = MemoryStore()
-    app.state.performance_monitor = PerformanceMonitor()
     yield
 
 app = FastAPI(title="Agentic RAG Framework API", version="0.1.0", lifespan=lifespan)
@@ -62,8 +60,6 @@ knowledge_bases: dict[str, dict] = {}
 
 @app.post("/knowledge_base")
 async def create_knowledge_base(entries: List[KnowledgeBaseEntry]):
-    task_id = f"knowledge_base_{int(time.time())}"
-    await app.state.performance_monitor.record_task_start(task_id)
     for entry in entries:
         knowledge_bases[entry.id] = {"paths": entry.paths, "databases": entry.databases}
         for path in entry.paths:
@@ -81,7 +77,6 @@ async def create_knowledge_base(entries: List[KnowledgeBaseEntry]):
                 )
                 await rag_agent.graph.ainvoke(rag_state)
     await AsyncLogger.info(f"Knowledge base created/updated for IDs: {[entry.id for entry in entries]}")
-    await app.state.performance_monitor.record_task_end(task_id, success=True)
     return {"message": "Knowledge base created/updated", "id": [entry.id for entry in entries]}
 
 @app.post("/upload_and_query")
@@ -89,8 +84,6 @@ async def upload_and_query(file: UploadFile = File(...), question: Optional[str]
     if not question and not summarize:
         raise HTTPException(status_code=400, detail="Question or summarize flag is required")
 
-    task_id = f"upload_query_{int(time.time())}"
-    await app.state.performance_monitor.record_task_start(task_id)
     start_time = time.time()
     file_path = f"temp_{file.filename}"
     try:
@@ -138,11 +131,9 @@ async def upload_and_query(file: UploadFile = File(...), question: Optional[str]
         await AsyncLogger.info(f"Processed query for {file.filename}: {final_result}")
         duration = time.time() - start_time
         await AsyncLogger.info(f"Endpoint /upload_and_query processed in {duration:.2f} seconds")
-        await app.state.performance_monitor.record_task_end(task_id, success=True)
         return final_result
     except Exception as e:
         await AsyncLogger.error(f"Error processing upload_and_query: {e}")
-        await app.state.performance_monitor.record_task_end(task_id, success=False)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if os.path.exists(file_path):
@@ -152,8 +143,6 @@ async def upload_and_query(file: UploadFile = File(...), question: Optional[str]
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     start_time = time.time()
-    task_id = f"chat_{int(time.time())}"
-    await app.state.performance_monitor.record_task_start(task_id)
     try:
         while True:
             data = await websocket.receive_json()
@@ -196,6 +185,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         await websocket.send_text(token)
                 await websocket.send_json({"end": True})
 
+            # Handle human review responses
             async def handle_human_review():
                 while True:
                     messages = await communicator.receive_messages("hierarchical_planner")
@@ -206,13 +196,12 @@ async def websocket_endpoint(websocket: WebSocket):
                             await communicator.send_message("human", "hierarchical_planner", response, {"response": response})
                     await asyncio.sleep(1)
 
+            # Run response streaming and human review handling concurrently
             await asyncio.gather(stream_response(), handle_human_review())
             duration = time.time() - start_time
             await AsyncLogger.info(f"Endpoint /chat processed in {duration:.2f} seconds")
-            await app.state.performance_monitor.record_task_end(task_id, success=True)
     except Exception as e:
         await AsyncLogger.error(f"Error in chat endpoint: {e}")
-        await app.state.performance_monitor.record_task_end(task_id, success=False)
         await websocket.send_json({"error": str(e)})
     finally:
         duration = time.time() - start_time
@@ -220,8 +209,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.post("/feedback")
 async def submit_feedback(query: str, response: str, rating: int, comment: Optional[str] = None):
-    task_id = f"feedback_{int(time.time())}"
-    await app.state.performance_monitor.record_task_start(task_id)
     start_time = time.time()
     await AsyncLogger.info(f"Feedback - Query: {query}, Response: {response}, Rating: {rating}, Comment: {comment}")
     llm_client = LLMClient(endpoint_type=ENDPOINT_TYPE, workspace_a=WORKSPACE_A, workspace_b=WORKSPACE_B)
@@ -234,16 +221,7 @@ async def submit_feedback(query: str, response: str, rating: int, comment: Optio
     refined_strategy = await reflective_agent.apply_improvements(reflection, "Feedback strategy", router)
     duration = time.time() - start_time
     await AsyncLogger.info(f"Endpoint /feedback processed in {duration:.2f} seconds")
-    await app.state.performance_monitor.record_task_end(task_id, success=True)
     return {"message": "Feedback received and processed", "reflection": result["result"].get("reflection", {}), "improvement": refined_strategy}
-
-@app.get("/metrics")
-async def get_metrics():
-    """
-    Expose performance metrics for monitoring.
-    """
-    metrics = await app.state.performance_monitor.get_metrics()
-    return metrics
 
 if __name__ == "__main__":
     import uvicorn
