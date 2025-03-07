@@ -48,7 +48,7 @@ class ReflectiveAgent:
             logger.warning("Reflection is disabled in config")
             return {"errors": "None", "improvements": "None", "strategy": "Maintain current approach"}
 
-        await AsyncLogger.info(f"Reflecting on query: {query}, response: {response}, feedback: {feedback}")
+        logger.info(f"Reflecting on query: {query}, response: {response}, feedback: {feedback}")
         text_context = "\n".join(multimodal_context.get("text", [])[:500]) if multimodal_context and "text" in multimodal_context else ""
         image_context = "\n".join([await asyncio.to_thread(self.llm_client.process_image, img) for img in multimodal_context.get("images", [])[:5]]) if multimodal_context and "images" in multimodal_context else ""
 
@@ -74,7 +74,6 @@ class ReflectiveAgent:
             task_id = f"reflection_{int(time.time())}"
             self.improvements[task_id] = reflection
             await AsyncLogger.info(f"Reflection completed in {duration:.2f} seconds: {reflection}")
-            # Notify other agents of potential improvements
             await self.communicator.send_message("reflective_agent", "router_agent", f"New reflection for task {task_id}: {reflection}", {"id": task_id})
             return reflection
         except Exception as e:
@@ -110,7 +109,7 @@ class ReflectiveAgent:
             "Reflect on this interaction: Stream a JSON object with 'errors', 'improvements', and 'strategy'."
         )
         async for token in self.llm_client.generate_stream(prompt, 
-                                                         image_base64=None if not multimodal_context or not multimodal_context["images"] else multimodal_context["images"][0]):
+                                                        image_base64=None if not multimodal_context or not multimodal_context["images"] else multimodal_context["images"][0]):
             yield token
             # Aggregate tokens into a valid JSON object for streaming
             if "}" in token:
