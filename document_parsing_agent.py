@@ -1,75 +1,66 @@
-from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field
-from typing import Optional, List
-from langchain_core.documents import Document
-from document_utils import async_extract_text_from_pdf, async_extract_images_from_pdf
-from utils.image_utils import pil_image_to_base64_jpeg
-from utils.llm_client import LLMClient
-from utils.config import LOG_LEVEL, MAX_IMAGES, IMAGE_QUALITY
-from utils.logger import logger, AsyncLogger
+from langgraph.graph import StateGraph, END
+from utils.image_utils import base64_to_pil_image
+from utils.logger import AsyncLogger
+from pypdf import PdfReader
+from pdf2image import convert_from_path
+import io
+import base64
+from utils.agent_communication import AgentMessage
+from agent_registry import AgentRegistry
 import asyncio
-from agent_registry import agent_registry  # Added import for agent_registry
 
-# Set log level from config
-from loguru import logger
-logger.remove()
-logger.add(lambda msg: print(msg), level=LOG_LEVEL, format="{time} {level} {message}")
+class DocumentLayoutParsingState:
+    def __init__(self, document_path=None, messages=None, multimodal_context=None):
+        self.document_path = document_path
+        self.pages_as_base64_jpeg_images = []
+        self.pages_as_text = []
+        self.documents = []
+        self.messages = messages or []
+        self.multimodal_context = multimodal_context or {"text": [], "images": []}
+        self.result = {}
 
-class DocumentLayoutParsingState(BaseModel):
-    document_path: str
-    pages_as_text: List[str] = Field(default_factory=list)
-    pages_as_base64_jpeg_images: List[str] = Field(default_factory=list)
-    documents: List[Document] = Field(default_factory=list)
-
-@agent_registry.register(
-    name="parsing_agent",
-    capabilities=["parsing"],
-    supported_doc_types=["generic", "term_sheet", "research_paper"]
-)
 class DocumentParsingAgent:
     def __init__(self):
-        self.llm_client = LLMClient()
-        self.graph = self.build_agent()
+        self.graph = StateGraph(DocumentLayoutParsingState)
+        self._build_graph()
 
-    async def parse_document(self, state: DocumentLayoutParsingState) -> dict:
-        try:
-            # Extract text and images asynchronously
-            text_pages = await async_extract_text_from_pdf(state.document_path)
-            image_pages = await async_extract_images_from_pdf(state.document_path)
-            
-            # Limit images to MAX_IMAGES and convert to base64
-            state.pages_as_text = text_pages[:5]  # Limit text for brevity
-            state.pages_as_base64_jpeg_images = [
-                await asyncio.to_thread(pil_image_to_base64_jpeg, img, quality=IMAGE_QUALITY)
-                for img in image_pages[:MAX_IMAGES]
-            ]
-            
-            # Create documents for RAG
-            state.documents = [
-                Document(page_content=text, metadata={"page_number": i, "element_type": "Text-block"})
-                for i, text in enumerate(state.pages_as_text)
-            ] + [
-                Document(page_content="", metadata={"page_number": i, "element_type": "Image", "image_base64": img_base64})
-                for i, img_base64 in enumerate(state.pages_as_base64_jpeg_images)
-            ]
-            
-            await AsyncLogger.info(f"Parsed document {state.document_path} into {len(state.documents)} documents")
-            return {
-                "pages_as_text": state.pages_as_text,
-                "pages_as_base64_jpeg_images": state.pages_as_base64_jpeg_images,
-                "documents": state.documents
-            }
-        except Exception as e:
-            await AsyncLogger.error(f"Error parsing document {state.document_path}: {e}")
-            return {
-                "pages_as_text": [],
-                "pages_as_base64_jpeg_images": [],
-                "documents": []
-            }
+    def _build_graph(self):
+        self.graph.add_node("parse_document", self.parse_document)
+        self.graph.set_entry_point("parse_document")
+        self.graph.add_edge("parse_document", END)
 
-    def build_agent(self):
-        builder = StateGraph(DocumentLayoutParsingState)
-        builder.add_node("parse_document", self.parse_document)
-        builder.add_edge(START, "parse_document")
-        builder.add_edge("parse_document", END)
-        return builder.compile()
+    async def parse_document(self, state: DocumentLayoutParsingState):
+        await AsyncLogger.info(f"Parsing document: {state.document_path}")
+        reader = PdfReader(state.document_path)
+        images = convert_from_path(state.document_path)
+        for page_num in range(len(reader.pages)):
+            text = reader.pages[page_num].extract_text()
+            state.pages_as_text.append(text)
+            if images:
+                image = images[page_num]
+                buffered = io.BytesIO()
+                image.save(buffered, format="JPEG")
+                state.pages_as_base64_jpeg_images.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
+        state.documents = [{"page_content": t, "metadata": {"element_type": "Text-block"}} for t in state.pages_as_text]
+        state.documents.extend([{"page_content": "", "metadata": {"element_type": "Image", "image_base64": img}} for img in state.pages_as_base64_jpeg_images])
+        if state.messages:
+            for msg in state.messages:
+                if msg.sender != self.__class__.__name__:
+                    await self.process_message(msg)
+        return state
+
+    async def process_message(self, message: AgentMessage):
+        await AsyncLogger.info(f"Received message from {message.sender}: {message.content}")
+        if "reparse" in message.content.lower():
+            return await self.parse_document({"document_path": message.task.get("document_path")})
+        return "Parsing complete"
+
+    async def update_strategy(self, improvement: str):
+        await AsyncLogger.info(f"Updating strategy with: {improvement}")
+        # Hypothetical logic to adjust parsing (e.g., image quality)
+        if "improve image quality" in improvement.lower():
+            pass  # Implement quality adjustment logic
+
+    async def graph(self, state: DocumentLayoutParsingState, start_node=None):
+        async for event in self.graph.stream(state, start_node=start_node):
+            yield event
