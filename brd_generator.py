@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 from langchain_community.chat_models import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
 import fitz  # PyMuPDF for better PDF processing
 import docx
 from docx.shared import Inches
@@ -30,6 +29,7 @@ from pathlib import Path
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from langchain.schema import HumanMessage, SystemMessage
 
 # Enhanced App Configuration
 st.set_page_config(
@@ -477,18 +477,20 @@ def create_risk_heatmap():
     
     st.plotly_chart(fig, use_container_width=True)
 
-# Enhanced LLM Configuration with ChatOpenAI
+# Enhanced LLM Configuration with Intelligence
 @st.cache_resource
 def init_enhanced_llm():
-    """Initialize ChatOpenAI with custom endpoint"""
+    """Initialize ChatOpenAI with custom configuration"""
     return ChatOpenAI(
-        openai_api_base="http://lwnde002xdgpu.sdi.corp.bankofamerica.com:8123/v1",
-        openai_api_key="dummy",
-        model_name="/phoenix/workspaces/nbkm74lv/llama3.3-4bit-awq",
-        temperature=0.3
+        base_url="http://lwnde002xdgpu.sdi.corp.bankofamerica.com:8123/v1",
+        api_key="dummy",
+        model="/phoenix/workspaces/nbkm74lv/llama3.3-4bit-awq",
+        temperature=0.3,
+        max_tokens=4000,
+        streaming=False
     )
 
-def generate_intelligent_brd_section(chat_model, section_name, section_config, document_text, images, formulas, document_analysis):
+def generate_intelligent_brd_section(llm: ChatOpenAI, section_name, section_config, document_text, images, formulas, document_analysis):
     """Generate BRD section with enhanced AI intelligence using ChatOpenAI"""
     
     # Context enhancement based on document analysis
@@ -563,14 +565,14 @@ def generate_intelligent_brd_section(chat_model, section_name, section_config, d
         """
     
     try:
-        # Create messages for ChatOpenAI
-        messages = [
-            SystemMessage(content="You are an expert business analyst with deep knowledge of regulatory compliance, business process optimization, and stakeholder management. Create professional, detailed, and actionable BRD content."),
-            HumanMessage(content=user_prompt)
-        ]
+        # Create message objects for ChatOpenAI
+        system_message = SystemMessage(
+            content="You are an expert business analyst with deep knowledge of regulatory compliance, business process optimization, and stakeholder management. Create professional, detailed, and actionable BRD content."
+        )
+        human_message = HumanMessage(content=user_prompt)
         
-        # Use invoke method instead of chat.completions.create
-        response = chat_model.invoke(messages)
+        # Get response from ChatOpenAI
+        response = llm([system_message, human_message])
         return response.content
     except Exception as e:
         st.error(f"Error generating {section_name}: {str(e)}")
@@ -718,4 +720,305 @@ def main():
                 
                 # Preview extracted content
                 with st.expander("🔍 Content Preview", expanded=False):
-                    preview_text = document_text[:2000] + "
+                    preview_text = document_text[:2000] + "..." if len(document_text) > 2000 else document_text
+                    st.text_area("Document Content", preview_text, height=200, disabled=True)
+                
+                # Media preview with enhanced display
+                if st.session_state.extracted_images or st.session_state.extracted_formulas:
+                    with st.expander("🎨 Extracted Media Gallery", expanded=False):
+                        if st.session_state.extracted_images:
+                            st.subheader("📸 Images")
+                            cols = st.columns(4)
+                            for idx, (img_key, img_b64) in enumerate(st.session_state.extracted_images.items()):
+                                with cols[idx % 4]:
+                                    display_image_from_base64(img_b64, caption=img_key, max_width=150)
+                        
+                        if st.session_state.extracted_formulas:
+                            st.subheader("📐 Mathematical Formulas")
+                            for i, formula in enumerate(st.session_state.extracted_formulas[:15]):
+                                with st.expander(f"Formula {i+1}"):
+                                    st.code(formula, language="text")
+        else:
+            st.info("👆 Please upload a document to begin AI-powered analysis")
+            
+            # Sample document showcase
+            st.subheader("📚 Sample Documents")
+            sample_docs = [
+                {"name": "GDPR Compliance Guide", "type": "Regulatory", "pages": 89, "complexity": "High"},
+                {"name": "SOX Internal Controls", "type": "Financial", "pages": 156, "complexity": "Medium"},
+                {"name": "API Security Standards", "type": "Technical", "pages": 45, "complexity": "Medium"},
+            ]
+            
+            for doc in sample_docs:
+                with st.expander(f"📄 {doc['name']}"):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.write(f"**Type:** {doc['type']}")
+                    with col2:
+                        st.write(f"**Pages:** {doc['pages']}")
+                    with col3:
+                        st.write(f"**Complexity:** {doc['complexity']}")
+    
+    with tab2:
+        if uploaded_file is not None and 'document_text' in locals():
+            # Enhanced BRD generation
+            st.subheader("🚀 AI-Powered BRD Generation")
+            
+            # Generation options
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                template_type = st.selectbox(
+                    "📋 BRD Template",
+                    ["Standard Enterprise", "Regulatory Compliance", "Technical Integration", "Business Process"]
+                )
+            with col2:
+                quality_level = st.selectbox(
+                    "🎯 Quality Level",
+                    ["Standard", "Premium", "Enterprise"]
+                )
+            with col3:
+                stakeholder_focus = st.selectbox(
+                    "👥 Stakeholder Focus",
+                    ["Balanced", "Business-Heavy", "Technical-Heavy", "Compliance-Heavy"]
+                )
+            
+            # Advanced generation options
+            with st.expander("⚙️ Advanced Generation Settings"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    include_risk_analysis = st.checkbox("Include Risk Analysis", value=True)
+                    include_timeline = st.checkbox("Include Implementation Timeline", value=True)
+                    include_kpis = st.checkbox("Include Success Metrics", value=True)
+                with col2:
+                    auto_stakeholder_mapping = st.checkbox("Auto-map Stakeholders", value=True)
+                    compliance_validation = st.checkbox("Compliance Validation", value=True)
+                    generate_appendices = st.checkbox("Generate Appendices", value=True)
+            
+            # Generate button with enhanced styling
+            if st.button("🚀 Generate Enhanced BRD", type="primary", use_container_width=True):
+                llm = init_enhanced_llm()
+                
+                # Enhanced progress tracking
+                progress_container = st.container()
+                with progress_container:
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    stage_info = st.empty()
+                
+                total_sections = len(ENHANCED_BRD_STRUCTURE)
+                section_count = 0
+                
+                # Pre-generation analysis
+                status_text.text("🧠 Performing pre-generation analysis...")
+                stage_info.info("Analyzing document structure and complexity...")
+                
+                for section_name, section_config in ENHANCED_BRD_STRUCTURE.items():
+                    if section_config.get("type") == "parent":
+                        st.session_state.brd_content[section_name] = {}
+                        for subsection_name, subsection_config in section_config["subsections"].items():
+                            status_text.text(f"🔄 Generating {subsection_name}...")
+                            stage_info.info(f"Using AI intelligence for: {subsection_name}")
+                            
+                            content = generate_intelligent_brd_section(
+                                llm, subsection_name, subsection_config, document_text,
+                                st.session_state.extracted_images, 
+                                st.session_state.extracted_formulas,
+                                st.session_state.document_analysis
+                            )
+                            
+                            if subsection_config["type"] == "table":
+                                df = parse_table_content(content, subsection_config["columns"])
+                                st.session_state.brd_content[section_name][subsection_name] = df
+                            else:
+                                st.session_state.brd_content[section_name][subsection_name] = content
+                            
+                            section_count += 1
+                            progress_bar.progress(section_count / total_sections)
+                    else:
+                        status_text.text(f"🔄 Generating {section_name}...")
+                        stage_info.info(f"Applying quality criteria for: {section_name}")
+                        
+                        content = generate_intelligent_brd_section(
+                            llm, section_name, section_config, document_text,
+                            st.session_state.extracted_images, 
+                            st.session_state.extracted_formulas,
+                            st.session_state.document_analysis
+                        )
+                        
+                        if section_config["type"] == "table":
+                            df = parse_table_content(content, section_config["columns"])
+                            st.session_state.brd_content[section_name] = df
+                        else:
+                            st.session_state.brd_content[section_name] = content
+                        
+                        section_count += 1
+                        progress_bar.progress(section_count / total_sections)
+                
+                # Post-generation quality analysis
+                status_text.text("✨ Performing quality analysis...")
+                stage_info.info("Running AI-powered quality checks...")
+                
+                # Calculate quality scores
+                st.session_state.compliance_checks = []
+                st.session_state.quality_scores = {}
+                
+                for section_name, content in st.session_state.brd_content.items():
+                    if section_name in ENHANCED_BRD_STRUCTURE:
+                        score, checks = calculate_quality_score(
+                            section_name, content, ENHANCED_BRD_STRUCTURE[section_name]
+                        )
+                        st.session_state.quality_scores[section_name] = score
+                        st.session_state.compliance_checks.extend(checks)
+                
+                progress_bar.progress(1.0)
+                status_text.text("✅ Enhanced BRD Generation Complete!")
+                stage_info.success("🎉 Your professional BRD is ready for review!")
+                st.session_state.generated = True
+                st.balloons()
+            
+            # Display generated content with enhanced editing
+            if st.session_state.generated and st.session_state.brd_content:
+                st.markdown("---")
+                st.header("📋 Enhanced BRD - Review & Edit")
+                
+                # Quality overview
+                if st.session_state.quality_scores:
+                    avg_quality = sum(st.session_state.quality_scores.values()) / len(st.session_state.quality_scores)
+                    quality_color = "🟢" if avg_quality >= 80 else "🟡" if avg_quality >= 60 else "🔴"
+                    st.success(f"{quality_color} **Overall Quality Score: {avg_quality:.1f}%**")
+                
+                # Section tabs for editing
+                section_tabs = st.tabs([name.split('.')[0] + "." for name in st.session_state.brd_content.keys()])
+                
+                for i, (section_name, content) in enumerate(st.session_state.brd_content.items()):
+                    with section_tabs[i]:
+                        # Section header with quality indicator
+                        quality_score = st.session_state.quality_scores.get(section_name, 0)
+                        quality_badge = "🟢" if quality_score >= 80 else "🟡" if quality_score >= 60 else "🔴"
+                        
+                        col1, col2, col3 = st.columns([3, 1, 1])
+                        with col1:
+                            st.subheader(section_name)
+                        with col2:
+                            st.metric("Quality", f"{quality_score:.0f}%")
+                        with col3:
+                            st.write(f"Status {quality_badge}")
+                        
+                        # Section-specific quality checks
+                        section_checks = [c for c in st.session_state.compliance_checks if c.section == section_name]
+                        if section_checks:
+                            with st.expander("🔍 Quality Insights"):
+                                for check in section_checks:
+                                    icon = "✅" if check.status == "PASS" else "⚠️" if check.status == "WARNING" else "❌"
+                                    st.write(f"{icon} **{check.check_type.title()}:** {check.message}")
+                        
+                        # Content editing
+                        if isinstance(content, dict):
+                            for subsection_name, subcontent in content.items():
+                                st.write(f"**{subsection_name}**")
+                                
+                                if isinstance(subcontent, pd.DataFrame):
+                                    # Enhanced table editor
+                                    st.write("📊 Interactive Table Editor:")
+                                    edited_df = st.data_editor(
+                                        subcontent,
+                                        use_container_width=True,
+                                        num_rows="dynamic",
+                                        column_config={
+                                            col: st.column_config.TextColumn(
+                                                help=f"Edit {col} values"
+                                            ) for col in subcontent.columns
+                                        },
+                                        key=f"enhanced_table_{section_name}_{subsection_name}"
+                                    )
+                                    st.session_state.brd_content[section_name][subsection_name] = edited_df
+                                    
+                                    # Table analytics
+                                    if not edited_df.empty:
+                                        col1, col2, col3 = st.columns(3)
+                                        with col1:
+                                            st.metric("Rows", len(edited_df))
+                                        with col2:
+                                            st.metric("Columns", len(edited_df.columns))
+                                        with col3:
+                                            completeness = (edited_df.notna().sum().sum() / (len(edited_df) * len(edited_df.columns))) * 100
+                                            st.metric("Completeness", f"{completeness:.0f}%")
+                                else:
+                                    # Enhanced text editor with AI suggestions
+                                    render_content_with_images(subcontent, st.session_state.extracted_images)
+                                    
+                                    col1, col2 = st.columns([3, 1])
+                                    with col1:
+                                        edited_text = st.text_area(
+                                            f"Edit {subsection_name}",
+                                            value=subcontent,
+                                            height=250,
+                                            key=f"enhanced_text_{section_name}_{subsection_name}",
+                                            help="Use rich text editing with AI assistance"
+                                        )
+                                        st.session_state.brd_content[section_name][subsection_name] = edited_text
+                                    
+                                    with col2:
+                                        st.write("**AI Assist**")
+                                        if st.button(f"✨ Enhance", key=f"enhance_{section_name}_{subsection_name}"):
+                                            st.info("AI enhancement coming soon!")
+                                        if st.button(f"📝 Summarize", key=f"summary_{section_name}_{subsection_name}"):
+                                            st.info("AI summarization coming soon!")
+                                
+                                st.markdown("---")
+                        else:
+                            # Single content editing
+                            if isinstance(content, pd.DataFrame):
+                                st.write("📊 Interactive Table Editor:")
+                                edited_df = st.data_editor(
+                                    content,
+                                    use_container_width=True,
+                                    num_rows="dynamic",
+                                    column_config={
+                                        col: st.column_config.TextColumn(
+                                            help=f"Edit {col} values"
+                                        ) for col in content.columns
+                                    },
+                                    key=f"enhanced_table_{section_name}"
+                                )
+                                st.session_state.brd_content[section_name] = edited_df
+                                
+                                # Enhanced table insights
+                                if not edited_df.empty:
+                                    with st.expander("📈 Table Insights"):
+                                        col1, col2, col3, col4 = st.columns(4)
+                                        with col1:
+                                            st.metric("Total Rows", len(edited_df))
+                                        with col2:
+                                            st.metric("Total Columns", len(edited_df.columns))
+                                        with col3:
+                                            empty_cells = edited_df.isna().sum().sum()
+                                            st.metric("Empty Cells", empty_cells)
+                                        with col4:
+                                            completeness = ((len(edited_df) * len(edited_df.columns) - empty_cells) / (len(edited_df) * len(edited_df.columns))) * 100
+                                            st.metric("Data Completeness", f"{completeness:.1f}%")
+                            else:
+                                # Enhanced text content editing
+                                render_content_with_images(content, st.session_state.extracted_images)
+                                
+                                col1, col2 = st.columns([3, 1])
+                                with col1:
+                                    edited_text = st.text_area(
+                                        f"Edit {section_name}",
+                                        value=content,
+                                        height=300,
+                                        key=f"enhanced_text_{section_name}",
+                                        help="Professional text editor with AI assistance"
+                                    )
+                                    st.session_state.brd_content[section_name] = edited_text
+                                
+                                with col2:
+                                    st.write("**AI Tools**")
+                                    if st.button(f"✨ AI Enhance", key=f"ai_enhance_{section_name}"):
+                                        st.info("🤖 AI enhancement will improve clarity, completeness, and professional tone")
+                                    if st.button(f"🔍 Grammar Check", key=f"grammar_{section_name}"):
+                                        st.info("📝 Grammar and style checking coming soon!")
+                                    if st.button(f"📊 Add Metrics", key=f"metrics_{section_name}"):
+                                        st.info("📈 Smart metric suggestions coming soon!")
+        else:
+            st.info("👆 Please upload and analyze a document first in the Document Analysis tab")
