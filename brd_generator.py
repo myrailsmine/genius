@@ -14,7 +14,7 @@ import os
 import tempfile
 from typing import Dict, List, Tuple, Any
 from reportlab.lib.pagesizes import letter, A4
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import SimpleDocDocument, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import inch
@@ -33,8 +33,8 @@ from langchain.schema import HumanMessage, SystemMessage
 
 # Enhanced App Configuration
 st.set_page_config(
-    page_title="🚀 AI-Powered BRD Generator Pro",
-    page_icon="🚀",
+    page_title="AI-Powered BRD Generator Pro",
+    page_icon="rocket",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -215,6 +215,170 @@ ENHANCED_BRD_STRUCTURE = {
     }
 }
 
+# Missing Function: Extract images and formulas from PDF
+def extract_images_and_formulas_from_pdf(uploaded_file):
+    """Extract text, images, and formulas from PDF"""
+    text = ""
+    images = {}
+    formulas = []
+    
+    try:
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.read())
+            tmp_file_path = tmp_file.name
+        
+        # Open PDF with fitz
+        doc = fitz.open(tmp_file_path)
+        
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            
+            # Extract text
+            text += page.get_text()
+            
+            # Extract images
+            image_list = page.get_images(full=True)
+            for img_index, img in enumerate(image_list):
+                xref = img[0]
+                pix = fitz.Pixmap(doc, xref)
+                
+                if pix.n < 5:  # GRAY or RGB
+                    img_data = pix.tobytes("png")
+                    img_b64 = base64.b64encode(img_data).decode()
+                    images[f"page_{page_num+1}_img_{img_index+1}"] = img_b64
+                pix = None
+            
+            # Extract potential formulas (text patterns that might be mathematical)
+            page_text = page.get_text()
+            formula_patterns = [
+                r'[=∑∏∫∆∇±≤≥≠≈∞]',
+                r'\b\w+\s*[+\-*/=]\s*\w+\b',
+                r'\([^)]*[+\-*/]\s*[^)]*\)',
+                r'\b\d+\.\d+\b',
+                r'[xy]\^?\d*',
+            ]
+            
+            for pattern in formula_patterns:
+                matches = re.findall(pattern, page_text, re.IGNORECASE)
+                formulas.extend(matches)
+        
+        doc.close()
+        os.unlink(tmp_file_path)
+        
+    except Exception as e:
+        st.error(f"Error processing PDF: {str(e)}")
+        return uploaded_file.read().decode('utf-8', errors='ignore'), {}, []
+    
+    # Remove duplicates from formulas
+    formulas = list(set(formulas))
+    return text, images, formulas
+
+# Missing Function: Extract images from DOCX
+def extract_images_from_docx(uploaded_file):
+    """Extract text and images from DOCX"""
+    text = ""
+    images = {}
+    
+    try:
+        doc = docx.Document(uploaded_file)
+        
+        # Extract text
+        for paragraph in doc.paragraphs:
+            text += paragraph.text + "\n"
+        
+        # Extract images from document relationships
+        for rel in doc.part.rels.values():
+            if "image" in rel.target_ref:
+                try:
+                    image_data = rel.target_part.blob
+                    img_b64 = base64.b64encode(image_data).decode()
+                    images[f"docx_img_{len(images)+1}"] = img_b64
+                except:
+                    continue
+                    
+    except Exception as e:
+        st.error(f"Error processing DOCX: {str(e)}")
+        return uploaded_file.read().decode('utf-8', errors='ignore'), {}
+    
+    return text, images
+
+# Missing Function: Display image from base64
+def display_image_from_base64(img_b64, caption="", max_width=None):
+    """Display image from base64 string"""
+    try:
+        img_data = base64.b64decode(img_b64)
+        img = Image.open(BytesIO(img_data))
+        
+        if max_width:
+            img.thumbnail((max_width, max_width))
+        
+        st.image(img, caption=caption, use_container_width=True if not max_width else False)
+    except Exception as e:
+        st.error(f"Error displaying image: {str(e)}")
+
+# Missing Function: Parse table content from AI response
+def parse_table_content(content: str, columns: List[str]) -> pd.DataFrame:
+    """Parse AI-generated table content into DataFrame"""
+    try:
+        lines = content.strip().split('\n')
+        data_rows = []
+        
+        for line in lines:
+            if '|' in line and line.strip():
+                # Clean and split the line
+                row = [cell.strip() for cell in line.split('|')]
+                # Remove empty cells at the beginning/end
+                row = [cell for cell in row if cell]
+                
+                # Skip header separators like |---|---|
+                if all(cell in ['', '---', '--', '-'] or set(cell) <= {'-', ' '} for cell in row):
+                    continue
+                
+                # Skip the column header row if it matches our expected columns
+                if len(row) == len(columns) and all(col.lower() in ' '.join(row).lower() for col in columns[:3]):
+                    continue
+                
+                # Pad or trim to match column count
+                if len(row) < len(columns):
+                    row.extend([''] * (len(columns) - len(row)))
+                elif len(row) > len(columns):
+                    row = row[:len(columns)]
+                
+                data_rows.append(row)
+        
+        # If no data rows found, create sample data
+        if not data_rows:
+            data_rows = [[''] * len(columns) for _ in range(3)]
+        
+        df = pd.DataFrame(data_rows, columns=columns)
+        return df
+    
+    except Exception as e:
+        st.error(f"Error parsing table content: {str(e)}")
+        # Return empty DataFrame with correct columns
+        return pd.DataFrame(columns=columns)
+
+# Missing Function: Render content with images
+def render_content_with_images(content: str, images: dict):
+    """Render text content and replace image references with actual images"""
+    if not content:
+        return
+    
+    # Split content by image references
+    parts = re.split(r'\[IMAGE:\s*([^\]]+)\]', content)
+    
+    for i, part in enumerate(parts):
+        if i % 2 == 0:  # Text content
+            if part.strip():
+                st.markdown(part)
+        else:  # Image reference
+            image_key = part.strip()
+            if image_key in images:
+                display_image_from_base64(images[image_key], caption=image_key)
+            else:
+                st.info(f"Image reference: {image_key} (not found)")
+
 # AI-Powered Document Analysis
 def analyze_document_intelligence(text: str, images: dict, formulas: list) -> dict:
     """Advanced AI-powered document analysis"""
@@ -332,7 +496,7 @@ def calculate_quality_score(section_name: str, content: Any, structure_config: d
 # Advanced Visualization Components
 def create_compliance_dashboard():
     """Create an interactive compliance dashboard"""
-    st.subheader("🎯 Compliance Dashboard")
+    st.subheader("Compliance Dashboard")
     
     # Calculate overall metrics
     total_sections = len(ENHANCED_BRD_STRUCTURE)
@@ -405,7 +569,7 @@ def create_compliance_dashboard():
 
 def create_stakeholder_matrix():
     """Create interactive stakeholder influence/interest matrix"""
-    st.subheader("👥 Stakeholder Analysis Matrix")
+    st.subheader("Stakeholder Analysis Matrix")
     
     # Sample stakeholder data (in real app, this would come from the BRD)
     stakeholders_data = [
@@ -443,7 +607,7 @@ def create_stakeholder_matrix():
 
 def create_risk_heatmap():
     """Create risk assessment heatmap"""
-    st.subheader("🔥 Risk Heat Map")
+    st.subheader("Risk Heat Map")
     
     # Sample risk data
     risks = [
@@ -583,14 +747,14 @@ def render_enhanced_header():
     """Render enhanced header with branding"""
     st.markdown("""
     <div class="main-header">
-        <h1>🚀 AI-Powered BRD Generator Pro</h1>
+        <h1>AI-Powered BRD Generator Pro</h1>
         <p>Transform regulatory documents into comprehensive Business Requirements Documents with advanced AI intelligence, real-time collaboration, and compliance tracking</p>
     </div>
     """, unsafe_allow_html=True)
 
 def render_workflow_timeline():
     """Render workflow timeline"""
-    st.subheader("📋 Workflow Timeline")
+    st.subheader("Workflow Timeline")
     
     timeline_steps = [
         {"step": "Document Upload", "status": "completed", "date": "Today"},
@@ -621,21 +785,188 @@ def render_workflow_timeline():
         </div>
         """, unsafe_allow_html=True)
 
+# Missing Function: Export functionality
+def export_to_word_docx(brd_content):
+    """Export BRD content to Word document"""
+    doc = docx.Document()
+    
+    # Add title
+    title = doc.add_heading('Business Requirements Document', 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # Add generation date
+    doc.add_paragraph(f"Generated on: {datetime.now().strftime('%B %d, %Y')}")
+    doc.add_page_break()
+    
+    for section_name, content in brd_content.items():
+        # Add section heading
+        doc.add_heading(section_name, level=1)
+        
+        if isinstance(content, dict):
+            # Handle parent sections with subsections
+            for subsection_name, subcontent in content.items():
+                doc.add_heading(subsection_name, level=2)
+                
+                if isinstance(subcontent, pd.DataFrame):
+                    # Add table
+                    table = doc.add_table(rows=1, cols=len(subcontent.columns))
+                    table.style = 'Light Grid Accent 1'
+                    
+                    # Add header row
+                    hdr_cells = table.rows[0].cells
+                    for i, column in enumerate(subcontent.columns):
+                        hdr_cells[i].text = str(column)
+                    
+                    # Add data rows
+                    for _, row in subcontent.iterrows():
+                        row_cells = table.add_row().cells
+                        for i, value in enumerate(row):
+                            row_cells[i].text = str(value) if pd.notna(value) else ""
+                else:
+                    # Add text content (removing image references for Word)
+                    clean_text = re.sub(r'\[IMAGE:\s*[^\]]+\]', '[Image Reference]', str(subcontent))
+                    doc.add_paragraph(clean_text)
+                
+                doc.add_paragraph()  # Add spacing
+        
+        elif isinstance(content, pd.DataFrame):
+            # Add table
+            table = doc.add_table(rows=1, cols=len(content.columns))
+            table.style = 'Light Grid Accent 1'
+            
+            # Add header row
+            hdr_cells = table.rows[0].cells
+            for i, column in enumerate(content.columns):
+                hdr_cells[i].text = str(column)
+            
+            # Add data rows
+            for _, row in content.iterrows():
+                row_cells = table.add_row().cells
+                for i, value in enumerate(row):
+                    row_cells[i].text = str(value) if pd.notna(value) else ""
+        
+        else:
+            # Add text content
+            clean_text = re.sub(r'\[IMAGE:\s*[^\]]+\]', '[Image Reference]', str(content))
+            doc.add_paragraph(clean_text)
+        
+        doc.add_page_break()
+    
+    # Save to bytes
+    doc_bytes = BytesIO()
+    doc.save(doc_bytes)
+    doc_bytes.seek(0)
+    return doc_bytes
+
+def export_to_pdf(brd_content):
+    """Export BRD content to PDF"""
+    buffer = BytesIO()
+    doc = SimpleDocDocument(buffer, pagesize=A4)
+    story = []
+    styles = getSampleStyleSheet()
+    
+    # Custom styles
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Title'],
+        fontSize=24,
+        textColor=colors.darkblue,
+        alignment=1,  # Center alignment
+        spaceAfter=30
+    )
+    
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading1'],
+        fontSize=16,
+        textColor=colors.darkblue,
+        spaceAfter=12
+    )
+    
+    # Add title
+    story.append(Paragraph("Business Requirements Document", title_style))
+    story.append(Paragraph(f"Generated on: {datetime.now().strftime('%B %d, %Y')}", styles['Normal']))
+    story.append(Spacer(1, 20))
+    
+    for section_name, content in brd_content.items():
+        # Add section heading
+        story.append(Paragraph(section_name, heading_style))
+        
+        if isinstance(content, dict):
+            # Handle subsections
+            for subsection_name, subcontent in content.items():
+                story.append(Paragraph(subsection_name, styles['Heading2']))
+                
+                if isinstance(subcontent, pd.DataFrame) and not subcontent.empty:
+                    # Create table data
+                    table_data = [subcontent.columns.tolist()]
+                    for _, row in subcontent.iterrows():
+                        table_data.append([str(val) if pd.notna(val) else "" for val in row])
+                    
+                    # Create table
+                    table = Table(table_data)
+                    table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0, 0), (-1, 0), 10),
+                        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                    ]))
+                    story.append(table)
+                else:
+                    clean_text = re.sub(r'\[IMAGE:\s*[^\]]+\]', '[Image Reference]', str(subcontent))
+                    story.append(Paragraph(clean_text, styles['Normal']))
+                
+                story.append(Spacer(1, 12))
+        
+        elif isinstance(content, pd.DataFrame) and not content.empty:
+            # Create table data
+            table_data = [content.columns.tolist()]
+            for _, row in content.iterrows():
+                table_data.append([str(val) if pd.notna(val) else "" for val in row])
+            
+            # Create table
+            table = Table(table_data)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            story.append(table)
+        
+        else:
+            clean_text = re.sub(r'\[IMAGE:\s*[^\]]+\]', '[Image Reference]', str(content))
+            story.append(Paragraph(clean_text, styles['Normal']))
+        
+        story.append(Spacer(1, 20))
+    
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
 # Main Application
 def main():
     render_enhanced_header()
     
     # Sidebar with enhanced options
-    st.sidebar.title("🚀 BRD Generator Pro")
+    st.sidebar.title("BRD Generator Pro")
     st.sidebar.markdown("Advanced AI-powered document transformation")
     
     # User profile section
-    st.sidebar.subheader("👤 User Profile")
+    st.sidebar.subheader("User Profile")
     user = st.session_state.current_user
-    st.sidebar.info(f"**{user.name}**\n{user.role}\n📧 {user.email}")
+    st.sidebar.info(f"**{user.name}**\n{user.role}\n{user.email}")
     
     # File upload section
-    st.sidebar.subheader("📁 Document Upload")
+    st.sidebar.subheader("Document Upload")
     uploaded_file = st.sidebar.file_uploader(
         "Upload Regulatory Document",
         type=['pdf', 'docx', 'txt'],
@@ -643,7 +974,7 @@ def main():
     )
     
     # Enhanced extraction options
-    st.sidebar.subheader("🎨 AI Enhancement Options")
+    st.sidebar.subheader("AI Enhancement Options")
     extract_images = st.sidebar.checkbox("Extract & Analyze Images", value=True)
     extract_formulas = st.sidebar.checkbox("Detect Mathematical Formulas", value=True)
     intelligent_analysis = st.sidebar.checkbox("Advanced Document Intelligence", value=True)
@@ -651,22 +982,22 @@ def main():
     risk_assessment = st.sidebar.checkbox("AI Risk Assessment", value=True)
     
     # Advanced options
-    with st.sidebar.expander("⚙️ Advanced Options"):
+    with st.sidebar.expander("Advanced Options"):
         max_images = st.slider("Max Images to Extract", 1, 100, 30)
         quality_threshold = st.slider("Quality Threshold", 0.0, 1.0, 0.7)
         collaboration_mode = st.checkbox("Enable Real-time Collaboration", value=False)
         
     # Main content area with tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📄 Document Analysis", "📋 BRD Generation", "📊 Analytics", "👥 Collaboration"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Document Analysis", "BRD Generation", "Analytics", "Collaboration"])
     
     with tab1:
         if uploaded_file is not None:
             # Document processing and analysis
             file_size_mb = uploaded_file.size / (1024 * 1024)
-            st.success(f"📄 **{uploaded_file.name}** uploaded successfully ({file_size_mb:.2f} MB)")
+            st.success(f"**{uploaded_file.name}** uploaded successfully ({file_size_mb:.2f} MB)")
             
             # Enhanced document extraction
-            with st.spinner("🧠 Performing advanced AI analysis..."):
+            with st.spinner("Performing advanced AI analysis..."):
                 if uploaded_file.type == "application/pdf":
                     document_text, extracted_images, extracted_formulas = extract_images_and_formulas_from_pdf(uploaded_file)
                 elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
@@ -691,18 +1022,18 @@ def main():
             # Enhanced metrics display
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("📝 Content", f"{len(document_text):,} chars")
+                st.metric("Content", f"{len(document_text):,} chars")
             with col2:
-                st.metric("🖼️ Images", len(st.session_state.extracted_images))
+                st.metric("Images", len(st.session_state.extracted_images))
             with col3:
-                st.metric("🧮 Formulas", len(st.session_state.extracted_formulas))
+                st.metric("Formulas", len(st.session_state.extracted_formulas))
             with col4:
                 complexity = st.session_state.document_analysis.get('complexity_score', 0)
-                st.metric("🎯 Complexity", f"{complexity:.1f}")
+                st.metric("Complexity", f"{complexity:.1f}")
             
             # Document intelligence insights
             if st.session_state.document_analysis:
-                st.subheader("🧠 AI Document Analysis")
+                st.subheader("AI Document Analysis")
                 analysis = st.session_state.document_analysis
                 
                 col1, col2 = st.columns(2)
@@ -719,30 +1050,30 @@ def main():
                         st.success(f"**Stakeholders Detected:** {len(analysis['stakeholder_mentions'])}")
                 
                 # Preview extracted content
-                with st.expander("🔍 Content Preview", expanded=False):
+                with st.expander("Content Preview", expanded=False):
                     preview_text = document_text[:2000] + "..." if len(document_text) > 2000 else document_text
                     st.text_area("Document Content", preview_text, height=200, disabled=True)
                 
                 # Media preview with enhanced display
                 if st.session_state.extracted_images or st.session_state.extracted_formulas:
-                    with st.expander("🎨 Extracted Media Gallery", expanded=False):
+                    with st.expander("Extracted Media Gallery", expanded=False):
                         if st.session_state.extracted_images:
-                            st.subheader("📸 Images")
+                            st.subheader("Images")
                             cols = st.columns(4)
                             for idx, (img_key, img_b64) in enumerate(st.session_state.extracted_images.items()):
                                 with cols[idx % 4]:
                                     display_image_from_base64(img_b64, caption=img_key, max_width=150)
                         
                         if st.session_state.extracted_formulas:
-                            st.subheader("📐 Mathematical Formulas")
+                            st.subheader("Mathematical Formulas")
                             for i, formula in enumerate(st.session_state.extracted_formulas[:15]):
                                 with st.expander(f"Formula {i+1}"):
                                     st.code(formula, language="text")
         else:
-            st.info("👆 Please upload a document to begin AI-powered analysis")
+            st.info("Please upload a document to begin AI-powered analysis")
             
             # Sample document showcase
-            st.subheader("📚 Sample Documents")
+            st.subheader("Sample Documents")
             sample_docs = [
                 {"name": "GDPR Compliance Guide", "type": "Regulatory", "pages": 89, "complexity": "High"},
                 {"name": "SOX Internal Controls", "type": "Financial", "pages": 156, "complexity": "Medium"},
@@ -750,7 +1081,7 @@ def main():
             ]
             
             for doc in sample_docs:
-                with st.expander(f"📄 {doc['name']}"):
+                with st.expander(f"{doc['name']}"):
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         st.write(f"**Type:** {doc['type']}")
@@ -762,28 +1093,28 @@ def main():
     with tab2:
         if uploaded_file is not None and 'document_text' in locals():
             # Enhanced BRD generation
-            st.subheader("🚀 AI-Powered BRD Generation")
+            st.subheader("AI-Powered BRD Generation")
             
             # Generation options
             col1, col2, col3 = st.columns(3)
             with col1:
                 template_type = st.selectbox(
-                    "📋 BRD Template",
+                    "BRD Template",
                     ["Standard Enterprise", "Regulatory Compliance", "Technical Integration", "Business Process"]
                 )
             with col2:
                 quality_level = st.selectbox(
-                    "🎯 Quality Level",
+                    "Quality Level",
                     ["Standard", "Premium", "Enterprise"]
                 )
             with col3:
                 stakeholder_focus = st.selectbox(
-                    "👥 Stakeholder Focus",
+                    "Stakeholder Focus",
                     ["Balanced", "Business-Heavy", "Technical-Heavy", "Compliance-Heavy"]
                 )
             
             # Advanced generation options
-            with st.expander("⚙️ Advanced Generation Settings"):
+            with st.expander("Advanced Generation Settings"):
                 col1, col2 = st.columns(2)
                 with col1:
                     include_risk_analysis = st.checkbox("Include Risk Analysis", value=True)
@@ -795,7 +1126,7 @@ def main():
                     generate_appendices = st.checkbox("Generate Appendices", value=True)
             
             # Generate button with enhanced styling
-            if st.button("🚀 Generate Enhanced BRD", type="primary", use_container_width=True):
+            if st.button("Generate Enhanced BRD", type="primary", use_container_width=True):
                 llm = init_enhanced_llm()
                 
                 # Enhanced progress tracking
@@ -809,14 +1140,14 @@ def main():
                 section_count = 0
                 
                 # Pre-generation analysis
-                status_text.text("🧠 Performing pre-generation analysis...")
+                status_text.text("Performing pre-generation analysis...")
                 stage_info.info("Analyzing document structure and complexity...")
                 
                 for section_name, section_config in ENHANCED_BRD_STRUCTURE.items():
                     if section_config.get("type") == "parent":
                         st.session_state.brd_content[section_name] = {}
                         for subsection_name, subsection_config in section_config["subsections"].items():
-                            status_text.text(f"🔄 Generating {subsection_name}...")
+                            status_text.text(f"Generating {subsection_name}...")
                             stage_info.info(f"Using AI intelligence for: {subsection_name}")
                             
                             content = generate_intelligent_brd_section(
@@ -835,7 +1166,7 @@ def main():
                             section_count += 1
                             progress_bar.progress(section_count / total_sections)
                     else:
-                        status_text.text(f"🔄 Generating {section_name}...")
+                        status_text.text(f"Generating {section_name}...")
                         stage_info.info(f"Applying quality criteria for: {section_name}")
                         
                         content = generate_intelligent_brd_section(
@@ -855,7 +1186,7 @@ def main():
                         progress_bar.progress(section_count / total_sections)
                 
                 # Post-generation quality analysis
-                status_text.text("✨ Performing quality analysis...")
+                status_text.text("Performing quality analysis...")
                 stage_info.info("Running AI-powered quality checks...")
                 
                 # Calculate quality scores
@@ -871,21 +1202,76 @@ def main():
                         st.session_state.compliance_checks.extend(checks)
                 
                 progress_bar.progress(1.0)
-                status_text.text("✅ Enhanced BRD Generation Complete!")
-                stage_info.success("🎉 Your professional BRD is ready for review!")
+                status_text.text("Enhanced BRD Generation Complete!")
+                stage_info.success("Your professional BRD is ready for review!")
                 st.session_state.generated = True
                 st.balloons()
             
             # Display generated content with enhanced editing
             if st.session_state.generated and st.session_state.brd_content:
                 st.markdown("---")
-                st.header("📋 Enhanced BRD - Review & Edit")
+                st.header("Enhanced BRD - Review & Edit")
+                
+                # Export options
+                st.subheader("Export Options")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    if st.button("Export to Word", type="secondary"):
+                        try:
+                            word_doc = export_to_word_docx(st.session_state.brd_content)
+                            st.download_button(
+                                label="Download Word Document",
+                                data=word_doc.getvalue(),
+                                file_name=f"BRD_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            )
+                        except Exception as e:
+                            st.error(f"Error exporting to Word: {str(e)}")
+                
+                with col2:
+                    if st.button("Export to PDF", type="secondary"):
+                        try:
+                            pdf_doc = export_to_pdf(st.session_state.brd_content)
+                            st.download_button(
+                                label="Download PDF Document",
+                                data=pdf_doc.getvalue(),
+                                file_name=f"BRD_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                                mime="application/pdf"
+                            )
+                        except Exception as e:
+                            st.error(f"Error exporting to PDF: {str(e)}")
+                
+                with col3:
+                    if st.button("Export to Excel", type="secondary"):
+                        try:
+                            with pd.ExcelWriter(BytesIO(), engine='xlsxwriter') as writer:
+                                for section_name, content in st.session_state.brd_content.items():
+                                    if isinstance(content, dict):
+                                        for subsection_name, subcontent in content.items():
+                                            if isinstance(subcontent, pd.DataFrame):
+                                                sheet_name = f"{section_name.split('.')[0]}_{subsection_name.split('.')[0]}"[:31]
+                                                subcontent.to_excel(writer, sheet_name=sheet_name, index=False)
+                                    elif isinstance(content, pd.DataFrame):
+                                        sheet_name = section_name.split('.')[0][:31]
+                                        content.to_excel(writer, sheet_name=sheet_name, index=False)
+                                
+                                excel_data = writer.book
+                            
+                            st.download_button(
+                                label="Download Excel File",
+                                data=writer.book,
+                                file_name=f"BRD_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                        except Exception as e:
+                            st.error(f"Error exporting to Excel: {str(e)}")
                 
                 # Quality overview
                 if st.session_state.quality_scores:
                     avg_quality = sum(st.session_state.quality_scores.values()) / len(st.session_state.quality_scores)
-                    quality_color = "🟢" if avg_quality >= 80 else "🟡" if avg_quality >= 60 else "🔴"
-                    st.success(f"{quality_color} **Overall Quality Score: {avg_quality:.1f}%**")
+                    quality_color = "green" if avg_quality >= 80 else "orange" if avg_quality >= 60 else "red"
+                    st.success(f"**Overall Quality Score: {avg_quality:.1f}%**")
                 
                 # Section tabs for editing
                 section_tabs = st.tabs([name.split('.')[0] + "." for name in st.session_state.brd_content.keys()])
@@ -894,7 +1280,7 @@ def main():
                     with section_tabs[i]:
                         # Section header with quality indicator
                         quality_score = st.session_state.quality_scores.get(section_name, 0)
-                        quality_badge = "🟢" if quality_score >= 80 else "🟡" if quality_score >= 60 else "🔴"
+                        quality_badge = "green" if quality_score >= 80 else "orange" if quality_score >= 60 else "red"
                         
                         col1, col2, col3 = st.columns([3, 1, 1])
                         with col1:
@@ -902,12 +1288,12 @@ def main():
                         with col2:
                             st.metric("Quality", f"{quality_score:.0f}%")
                         with col3:
-                            st.write(f"Status {quality_badge}")
+                            st.write(f"Status: {quality_badge}")
                         
                         # Section-specific quality checks
                         section_checks = [c for c in st.session_state.compliance_checks if c.section == section_name]
                         if section_checks:
-                            with st.expander("🔍 Quality Insights"):
+                            with st.expander("Quality Insights"):
                                 for check in section_checks:
                                     icon = "✅" if check.status == "PASS" else "⚠️" if check.status == "WARNING" else "❌"
                                     st.write(f"{icon} **{check.check_type.title()}:** {check.message}")
@@ -919,7 +1305,7 @@ def main():
                                 
                                 if isinstance(subcontent, pd.DataFrame):
                                     # Enhanced table editor
-                                    st.write("📊 Interactive Table Editor:")
+                                    st.write("Interactive Table Editor:")
                                     edited_df = st.data_editor(
                                         subcontent,
                                         use_container_width=True,
@@ -929,7 +1315,165 @@ def main():
                                                 help=f"Edit {col} values"
                                             ) for col in subcontent.columns
                                         },
-                                        key=f"enhanced_table_{section_name}_{subsection_name}"
+                                        key=f"enhanced_text_{section_name}",
+                                        help="Professional text editor with AI assistance"
+                                    )
+                                    st.session_state.brd_content[section_name] = edited_text
+                                
+                                with col2:
+                                    st.write("**AI Tools**")
+                                    if st.button(f"AI Enhance", key=f"ai_enhance_{section_name}"):
+                                        st.info("AI enhancement will improve clarity, completeness, and professional tone")
+                                    if st.button(f"Grammar Check", key=f"grammar_{section_name}"):
+                                        st.info("Grammar and style checking coming soon!")
+                                    if st.button(f"Add Metrics", key=f"metrics_{section_name}"):
+                                        st.info("Smart metric suggestions coming soon!")
+        else:
+            st.info("Please upload and analyze a document first in the Document Analysis tab")
+    
+    with tab3:
+        st.subheader("Analytics Dashboard")
+        
+        if st.session_state.generated and st.session_state.brd_content:
+            # Create analytics dashboards
+            create_compliance_dashboard()
+            
+            st.markdown("---")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                create_stakeholder_matrix()
+            with col2:
+                create_risk_heatmap()
+            
+            # Workflow timeline
+            st.markdown("---")
+            render_workflow_timeline()
+            
+        else:
+            st.info("Generate a BRD first to view analytics")
+            
+            # Sample analytics preview
+            st.subheader("Sample Analytics Preview")
+            
+            # Sample quality metrics
+            sample_data = {
+                'Section': ['Executive Summary', 'Background', 'Scope', 'Stakeholders', 'Requirements'],
+                'Quality Score': [85, 92, 78, 88, 95],
+                'Completeness': [90, 95, 80, 85, 98],
+                'Compliance': [88, 90, 85, 92, 96]
+            }
+            
+            df_sample = pd.DataFrame(sample_data)
+            
+            fig = px.bar(df_sample, x='Section', y=['Quality Score', 'Completeness', 'Compliance'],
+                        title="Sample BRD Quality Metrics", barmode='group')
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with tab4:
+        st.subheader("Collaboration Hub")
+        
+        # User management section
+        st.write("**Team Members**")
+        team_members = [
+            {"name": "Alice Johnson", "role": "Business Analyst", "status": "Active", "last_seen": "5 min ago"},
+            {"name": "Bob Smith", "role": "Compliance Officer", "status": "Active", "last_seen": "2 hours ago"},
+            {"name": "Carol Davis", "role": "Technical Lead", "status": "Away", "last_seen": "1 day ago"},
+        ]
+        
+        for member in team_members:
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.write(f"**{member['name']}**")
+            with col2:
+                st.write(member['role'])
+            with col3:
+                status_color = "green" if member['status'] == 'Active' else "orange"
+                st.write(f":{status_color}[{member['status']}]")
+            with col4:
+                st.write(member['last_seen'])
+        
+        st.markdown("---")
+        
+        # Comments and feedback section
+        st.write("**Comments & Feedback**")
+        
+        # Comment input
+        new_comment = st.text_area("Add a comment", placeholder="Share your feedback or ask questions...")
+        if st.button("Post Comment"):
+            if new_comment:
+                if 'comments' not in st.session_state:
+                    st.session_state.comments = []
+                st.session_state.comments.append({
+                    'user': st.session_state.current_user.name,
+                    'comment': new_comment,
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                st.success("Comment added!")
+                st.rerun()
+        
+        # Display comments
+        if 'comments' in st.session_state and st.session_state.comments:
+            for comment in reversed(st.session_state.comments[-10:]):  # Show last 10 comments
+                with st.container():
+                    st.write(f"**{comment['user']}** - {comment['timestamp']}")
+                    st.write(comment['comment'])
+                    st.markdown("---")
+        else:
+            st.info("No comments yet. Start a discussion!")
+        
+        # Approval workflow
+        st.markdown("---")
+        st.write("**Approval Workflow**")
+        
+        approval_stages = [
+            {"stage": "Business Analysis Review", "assignee": "Alice Johnson", "status": "Completed", "date": "2024-01-15"},
+            {"stage": "Compliance Review", "assignee": "Bob Smith", "status": "In Progress", "date": "2024-01-16"},
+            {"stage": "Technical Review", "assignee": "Carol Davis", "status": "Pending", "date": "2024-01-17"},
+            {"stage": "Final Approval", "assignee": "Management", "status": "Pending", "date": "2024-01-18"},
+        ]
+        
+        for stage in approval_stages:
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.write(f"**{stage['stage']}**")
+            with col2:
+                st.write(stage['assignee'])
+            with col3:
+                if stage['status'] == 'Completed':
+                    st.success(stage['status'])
+                elif stage['status'] == 'In Progress':
+                    st.warning(stage['status'])
+                else:
+                    st.info(stage['status'])
+            with col4:
+                st.write(stage['date'])
+        
+        # Version history
+        st.markdown("---")
+        st.write("**Version History**")
+        
+        versions = [
+            {"version": "v1.0", "author": "AI Generator", "date": "2024-01-15 10:30", "changes": "Initial BRD generation"},
+            {"version": "v1.1", "author": "Alice Johnson", "date": "2024-01-15 14:20", "changes": "Updated executive summary"},
+            {"version": "v1.2", "author": "Bob Smith", "date": "2024-01-16 09:15", "changes": "Added compliance requirements"},
+        ]
+        
+        for version in versions:
+            with st.expander(f"{version['version']} - {version['date']}"):
+                st.write(f"**Author:** {version['author']}")
+                st.write(f"**Changes:** {version['changes']}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button(f"Restore {version['version']}", key=f"restore_{version['version']}"):
+                        st.info("Version restore functionality coming soon!")
+                with col2:
+                    if st.button(f"Compare {version['version']}", key=f"compare_{version['version']}"):
+                        st.info("Version comparison coming soon!")
+
+
+if __name__ == "__main__":
+    main()=f"enhanced_table_{section_name}_{subsection_name}"
                                     )
                                     st.session_state.brd_content[section_name][subsection_name] = edited_df
                                     
@@ -960,16 +1504,16 @@ def main():
                                     
                                     with col2:
                                         st.write("**AI Assist**")
-                                        if st.button(f"✨ Enhance", key=f"enhance_{section_name}_{subsection_name}"):
+                                        if st.button(f"Enhance", key=f"enhance_{section_name}_{subsection_name}"):
                                             st.info("AI enhancement coming soon!")
-                                        if st.button(f"📝 Summarize", key=f"summary_{section_name}_{subsection_name}"):
+                                        if st.button(f"Summarize", key=f"summary_{section_name}_{subsection_name}"):
                                             st.info("AI summarization coming soon!")
                                 
                                 st.markdown("---")
                         else:
                             # Single content editing
                             if isinstance(content, pd.DataFrame):
-                                st.write("📊 Interactive Table Editor:")
+                                st.write("Interactive Table Editor:")
                                 edited_df = st.data_editor(
                                     content,
                                     use_container_width=True,
@@ -985,7 +1529,7 @@ def main():
                                 
                                 # Enhanced table insights
                                 if not edited_df.empty:
-                                    with st.expander("📈 Table Insights"):
+                                    with st.expander("Table Insights"):
                                         col1, col2, col3, col4 = st.columns(4)
                                         with col1:
                                             st.metric("Total Rows", len(edited_df))
@@ -1007,18 +1551,4 @@ def main():
                                         f"Edit {section_name}",
                                         value=content,
                                         height=300,
-                                        key=f"enhanced_text_{section_name}",
-                                        help="Professional text editor with AI assistance"
-                                    )
-                                    st.session_state.brd_content[section_name] = edited_text
-                                
-                                with col2:
-                                    st.write("**AI Tools**")
-                                    if st.button(f"✨ AI Enhance", key=f"ai_enhance_{section_name}"):
-                                        st.info("🤖 AI enhancement will improve clarity, completeness, and professional tone")
-                                    if st.button(f"🔍 Grammar Check", key=f"grammar_{section_name}"):
-                                        st.info("📝 Grammar and style checking coming soon!")
-                                    if st.button(f"📊 Add Metrics", key=f"metrics_{section_name}"):
-                                        st.info("📈 Smart metric suggestions coming soon!")
-        else:
-            st.info("👆 Please upload and analyze a document first in the Document Analysis tab")
+                                        key
